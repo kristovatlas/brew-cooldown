@@ -80,7 +80,9 @@ jobs:
 
   coverage:
     name: coverage (kcov)
-    runs-on: ubuntu-latest
+    # ubuntu-22.04 (jammy) ships kcov in apt; noble (24.04) dropped it.
+    # Switch back to ubuntu-latest if/when kcov returns, or build from source.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies (kcov + jq + curl)
