@@ -72,14 +72,16 @@ Config file: `${XDG_CONFIG_HOME:-$HOME/.config}/brew-cooldown/config`, format `K
 
 ## Tests and coverage
 
-The bats suite covers every row of the behavior spec; no real `brew install/upgrade/reinstall` is invoked. Line coverage is measured by `kcov` and reported on every PR:
+The bats suite covers every row of the behavior spec; no real `brew install/upgrade/reinstall` is invoked. Line coverage is measured by `kcov` and reported on every PR.
+
+**v1 baseline: 86% line coverage (238 / 275 lines).** Current coverage is posted to every PR's CI summary.
 
 ```sh
 bats -r tests/                # runs the suite (65 tests)
 ./tests/coverage.sh           # runs under kcov, opens coverage/index.html
 ```
 
-CI publishes a coverage percentage to each PR's workflow summary and uploads the HTML report as the `coverage-html` artifact. See [`CONTRIBUTING.md`](CONTRIBUTING.md#test-coverage).
+CI publishes the coverage percentage to each PR's workflow summary and uploads the full HTML report as the `coverage-html` artifact. See [`CONTRIBUTING.md`](CONTRIBUTING.md#test-coverage).
 
 ## License
 
