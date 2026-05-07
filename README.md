@@ -70,6 +70,17 @@ Config file: `${XDG_CONFIG_HOME:-$HOME/.config}/brew-cooldown/config`, format `K
 - [`docs/architecture.md`](docs/architecture.md) — how it works
 - [`docs/adr/`](docs/adr/) — design decisions
 
+## Tests and coverage
+
+The bats suite covers every row of the behavior spec; no real `brew install/upgrade/reinstall` is invoked. Line coverage is measured by `kcov` and reported on every PR:
+
+```sh
+bats -r tests/                # runs the suite (65 tests)
+./tests/coverage.sh           # runs under kcov, opens coverage/index.html
+```
+
+CI publishes a coverage percentage to each PR's workflow summary and uploads the HTML report as the `coverage-html` artifact. See [`CONTRIBUTING.md`](CONTRIBUTING.md#test-coverage).
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).

@@ -77,3 +77,27 @@ jobs:
         run: |
           ./install.sh --prefix "$RUNNER_TEMP/bin" --uninstall
           test ! -e "$RUNNER_TEMP/bin/brew-cooldown"
+
+  coverage:
+    name: coverage (kcov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (kcov + jq + curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y kcov jq curl
+      - name: Install bats-core
+        run: |
+          git clone --depth 1 --branch v1.11.0 https://github.com/bats-core/bats-core.git "$RUNNER_TEMP/bats"
+          sudo "$RUNNER_TEMP/bats/install.sh" /usr/local
+          bats --version
+      - name: Run coverage
+        run: ./tests/coverage.sh --ci
+      - name: Upload coverage HTML artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage/
+          retention-days: 14

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `tests/coverage.sh` — kcov-based line coverage script with `--ci` and `--threshold` flags
+- New CI job `coverage (kcov)`: runs the bats suite under kcov, posts coverage % to the workflow step summary, uploads HTML report as `coverage-html` artifact
+- README and CONTRIBUTING.md document how to view coverage locally and in CI
 - README "Why" section now cites prior art (pnpm 11 `minimumReleaseAge` default, Mini Shai-Hulud context, Endor Labs / Socket guidance) and links the three open Homebrew tracking issues (#21129, #21421, #22000)
 - Initial v1: `brew-cooldown install|upgrade|reinstall` with default 7-day cooldown
 - GitHub commits API as the version-release-date data source

@@ -20,8 +20,11 @@ The threat model and architecture diagrams must stay in sync with the implementa
 
 ```sh
 # install dev deps (linux):
-sudo apt-get install -y shellcheck bats jq
+sudo apt-get install -y shellcheck bats jq kcov
 # (shfmt: download from https://github.com/mvdan/sh/releases)
+
+# install dev deps (macOS):
+brew install shellcheck shfmt bats-core jq kcov
 
 # run lint + tests:
 shellcheck bin/brew-cooldown install.sh tests/**/*.bash 2>/dev/null
@@ -30,6 +33,25 @@ bats -r tests/
 ```
 
 CI runs the same set on every PR.
+
+## Test coverage
+
+Line coverage is measured with [`kcov`](https://github.com/SimonKagstrom/kcov) over the bats suite. Run it locally:
+
+```sh
+./tests/coverage.sh
+# → ./coverage/index.html
+```
+
+CI runs the same script with `--ci`, prints a coverage summary to the workflow step summary on every PR, and uploads the full HTML report as the `coverage-html` artifact.
+
+To enforce a coverage floor in CI (e.g., for protected branches):
+
+```sh
+./tests/coverage.sh --ci --threshold 80   # exits non-zero if coverage < 80%
+```
+
+Note: real `brew install/upgrade/reinstall` is never invoked, even under coverage. If a code path can't be exercised without real brew, document that on the spec row and write the closest meaningful test (typically asserting the brew argv that *would* be invoked).
 
 ## Pull requests
 

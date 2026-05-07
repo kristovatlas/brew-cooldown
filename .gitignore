@@ -7,6 +7,9 @@
 .bats-temp/
 tests/.tmp/
 
+# kcov coverage output
+coverage/
+
 # editor / IDE
 .idea/
 .vscode/
