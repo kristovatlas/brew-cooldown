@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- README "Why" section now cites prior art (pnpm 11 `minimumReleaseAge` default, Mini Shai-Hulud context, Endor Labs / Socket guidance) and links the three open Homebrew tracking issues (#21129, #21421, #22000)
 - Initial v1: `brew-cooldown install|upgrade|reinstall` with default 7-day cooldown
 - GitHub commits API as the version-release-date data source
 - Fail-closed default; `BREW_COOLDOWN_FAIL_OPEN=1` to flip

@@ -4,7 +4,23 @@ A defensive wrapper around Homebrew that refuses to install, upgrade, or reinsta
 
 ## Why
 
-If a maintainer account or formula PR is compromised and a malicious version lands in `homebrew-core`, anyone who runs `brew upgrade <pkg>` in the next few hours or days gets the payload. By the time the security community catches and reverts the formula, you've already executed it. `brew-cooldown` introduces a **window of skepticism**: hold off on new versions for a few days while the broader community (and Homebrew maintainers) have a chance to detect and revert compromises.
+Homebrew formulae are Ruby files. `brew install <pkg>` and `brew upgrade <pkg>` run arbitrary Ruby at install time — the same threat profile as an npm `postinstall` script. Homebrew is also widely used as a developer workstation package manager, which makes a compromised popular formula a high-yield target. If a maintainer account or formula PR is compromised and a malicious version lands in `homebrew-core` or `homebrew-cask`, anyone who runs `brew install`/`brew upgrade` in the next few hours or days executes the payload. By the time the security community catches and reverts it, the damage is done.
+
+### Prior art
+
+The JavaScript ecosystem has been adopting this exact pattern after a string of 2025–2026 supply-chain compromises (the [Mini Shai-Hulud](https://socket.dev/blog/pnpm-11-adds-new-supply-chain-protection-defaults) campaign hit npm, PyPI, and Packagist):
+
+- **[pnpm 11](https://pnpm.io/blog/releases/11.0)** ships [`minimumReleaseAge`](https://pnpm.io/settings#minimumreleaseage) defaulting to **1440 minutes (1 day)** — newly published package versions aren't resolved until they're at least 24 hours old.
+- pnpm's official [supply-chain security guide](https://pnpm.io/supply-chain-security) recommends using a longer minimum release age.
+- Security tooling and guidance from Socket, Endor Labs, and others recommend the same pattern across the npm ecosystem.
+
+Homebrew has **open issues requesting this exact feature** — none implemented as of writing:
+
+- [Homebrew/brew#21129](https://github.com/Homebrew/brew/issues/21129) — *dependency cooldown to mitigate supply chain attacks* (Nov 2025)
+- [Homebrew/brew#21421](https://github.com/Homebrew/brew/issues/21421) — *Minimum age during `brew install` and `brew upgrade`* (Jan 2026)
+- [Homebrew/brew#22000](https://github.com/Homebrew/brew/issues/22000) — *Add optional cooldown window arg to `brew outdated`* (Apr 2026)
+
+`brew-cooldown` is a small external wrapper that fills the gap until Homebrew ships first-class support. It introduces a **window of skepticism**: hold off on new versions for a few days while the broader community (and Homebrew maintainers) have a chance to detect and revert compromises.
 
 This is **defense-in-depth**, not a primary control. Read [`docs/threat-model.md`](docs/threat-model.md) for what we mitigate and what we don't.
 
