@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.svg" alt="brew-cooldown" width="480">
+</p>
+
 # brew-cooldown
 
 A defensive wrapper around Homebrew that refuses to install, upgrade, or reinstall a formula whose current version landed in `homebrew-core` (or `homebrew-cask`) less than `N` days ago. Default `N=7`.
