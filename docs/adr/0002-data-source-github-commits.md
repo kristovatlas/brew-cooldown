@@ -23,6 +23,17 @@ GET https://api.github.com/repos/Homebrew/homebrew-core/commits?path=Formula/w/w
 
 Parse `.[0].commit.committer.date`.
 
+### Why `committer.date` and not `author.date`
+
+Both Git fields are user-controllable at commit-creation time via `GIT_COMMITTER_DATE` / `GIT_AUTHOR_DATE`. The two diverge under merge:
+
+- **`author.date`** is preserved through GitHub's squash and rebase merge strategies by default, so a contributor can set it to anything (e.g., backdate to 1970) and it survives into `main` unchanged.
+- **`committer.date`** is overwritten at merge time by GitHub's server when squash- or rebase-merging — it becomes the merge timestamp, set server-side, not by the contributor.
+
+`Homebrew/homebrew-core` and `Homebrew/homebrew-cask` accept changes only via PRs merged with squash (auto-merged by `BrewTestBot` or maintainers). Under that policy `committer.date` is effectively a server-stamped publish time, while `author.date` is contributor-controlled. We use `committer.date` for that reason.
+
+This buys us non-forgeability *as long as the upstream merge policy stays squash/rebase and direct-push to `main` is blocked by branch protection*. If that ever changes, this assumption breaks — see [`docs/threat-model.md`](../threat-model.md) non-mitigation #8 for the full discussion. A v2 enhancement would cross-check the PR's `merged_at` (GitHub-stamped, never user-controlled) as a stronger signal.
+
 ## Consequences
 
 **Accepted positives:**

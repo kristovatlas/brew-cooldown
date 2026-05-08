@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Threat model: explicit non-mitigations #8 (committer-date forgeability dependency on Homebrew's PR-only merge policy) and #9 (TOCTOU gap between our API check and `exec brew`)
+- ADR-0002: documents *why* we use `commit.committer.date` over `commit.author.date` (squash/rebase resets committer server-side; author is contributor-controlled)
 - `tests/coverage.sh` — kcov-based line coverage script with `--ci` and `--threshold` flags
 - New CI job `coverage (kcov)` (pinned to `ubuntu-22.04` since 24.04/noble dropped kcov from apt): runs the bats suite under kcov, posts coverage % to the workflow step summary, uploads HTML report as `coverage-html` artifact
 - README and CONTRIBUTING.md document how to view coverage locally and in CI
