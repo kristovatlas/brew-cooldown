@@ -31,7 +31,7 @@ This is **defense-in-depth**, not a primary control. Read [`docs/threat-model.md
 ## Install
 
 ```sh
-git clone https://github.com/<your-fork>/brew-cooldown.git
+git clone https://github.com/kristovatlas/brew-cooldown.git
 cd brew-cooldown
 ./install.sh
 ```
