@@ -1,0 +1,562 @@
+#!/usr/bin/env bash
+# brew-cooldown: refuse Homebrew install/upgrade/reinstall of formulae whose
+# current version landed in homebrew-core (or homebrew-cask) less than N days
+# ago. Defense-in-depth against the "compromised formula caught within days"
+# supply-chain class.
+#
+# See docs/spec.md for behavior, docs/threat-model.md for what's protected.
+
+# Strict mode in production. Skipped when sourced in lib mode for tests, since
+# set -e would otherwise infect the bats test harness.
+if [[ "${BREW_COOLDOWN_LIB_ONLY:-0}" != "1" ]]; then
+    set -euo pipefail
+    IFS=$'\n\t'
+fi
+
+readonly BC_VERSION="0.1.0"
+readonly BC_DEFAULT_DAYS=7
+readonly BC_GITHUB_API="https://api.github.com"
+readonly BC_CORE_REPO="Homebrew/homebrew-core"
+readonly BC_CASK_REPO="Homebrew/homebrew-cask"
+# Formula/cask names: lowercase letter or digit start; then letters, digits,
+# . _ + @ - allowed. Max 100 chars. Stricter than Homebrew's actual rules
+# (which permit some uppercase) — we are deliberately conservative.
+readonly BC_NAME_RE='^[a-z0-9][a-zA-Z0-9._+@-]{0,99}$'
+
+# Mutable state populated by helpers. Globals because bash 3.2 can't return
+# multiple values from a function cleanly.
+_age_days=""
+_eligible_at_iso=""
+_latest_commit_iso=""
+_error_reason=""
+_cfg_days=""
+_cfg_token=""
+_cfg_fail_open=""
+_cfg_disable=""
+_cfg_debug=""
+
+###############################################################################
+# logging / errors
+###############################################################################
+
+log_info()  { printf 'brew-cooldown: %s\n' "$*" >&2; }
+log_warn()  { printf 'brew-cooldown: WARN: %s\n' "$*" >&2; }
+log_error() { printf 'brew-cooldown: ERROR: %s\n' "$*" >&2; }
+debug() {
+    if [[ "${BC_DEBUG:-0}" == "1" ]]; then
+        printf 'brew-cooldown: DEBUG: %s\n' "$*" >&2
+    fi
+}
+
+# Redact GitHub-token-shaped substrings from any message before logging.
+mask_token() {
+    local s="${1:-}"
+    s="$(printf '%s' "$s" | sed -E 's/(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]+/[REDACTED]/g')"
+    s="$(printf '%s' "$s" | sed -E 's/([Aa]uthorization: [Bb]earer )[A-Za-z0-9._~+/=-]+/\1[REDACTED]/g')"
+    printf '%s' "$s"
+}
+
+die() {
+    local code="$1"; shift
+    log_error "$*"
+    exit "$code"
+}
+
+###############################################################################
+# url encoding (only for the chars we know GitHub treats specially)
+###############################################################################
+
+urlencode() {
+    local s="$1"
+    s="${s//%/%25}"
+    s="${s//@/%40}"
+    s="${s//+/%2B}"
+    s="${s// /%20}"
+    printf '%s' "$s"
+}
+
+###############################################################################
+# validation
+###############################################################################
+
+# Check if a formula/cask name is well-formed and not a third-party tap.
+# Returns 0 if valid, 1 otherwise. Never invokes curl or brew.
+validate_formula_name() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then return 1; fi
+    if [[ ${#name} -gt 100 ]]; then return 1; fi
+    if [[ "$name" == */* ]]; then return 1; fi
+    if [[ ! "$name" =~ $BC_NAME_RE ]]; then return 1; fi
+    return 0
+}
+
+###############################################################################
+# config file
+###############################################################################
+
+# Parse $XDG_CONFIG_HOME/brew-cooldown/config (or $HOME/.config/...).
+# Strict KEY=value lines. Allowlist-validated. Never sourced.
+load_config() {
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/brew-cooldown/config"
+    if [[ ! -r "$cfg" ]]; then return 0; fi
+
+    local line key value lineno=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ -z "$line" ]]; then continue; fi
+        if [[ "$line" == \#* ]]; then continue; fi
+        if [[ ! "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]]; then
+            debug "config $cfg:$lineno ignored (not KEY=value)"
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        if [[ "$value" =~ ^\"(.*)\"$ ]] || [[ "$value" =~ ^\'(.*)\'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+        case "$key" in
+            BREW_COOLDOWN_DAYS)
+                if [[ "$value" =~ ^[0-9]{1,4}$ ]]; then _cfg_days="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_DAYS rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_GITHUB_TOKEN)
+                if [[ "$value" =~ ^[A-Za-z0-9_]{1,200}$ ]]; then _cfg_token="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_GITHUB_TOKEN rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_FAIL_OPEN)
+                if [[ "$value" =~ ^[01]$ ]]; then _cfg_fail_open="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_FAIL_OPEN rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_DISABLE)
+                if [[ "$value" =~ ^[01]$ ]]; then _cfg_disable="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_DISABLE rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_DEBUG)
+                if [[ "$value" =~ ^[01]$ ]]; then _cfg_debug="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_DEBUG rejected"
+                fi
+                ;;
+            *)
+                debug "config $cfg:$lineno unrecognized key $key"
+                ;;
+        esac
+    done < "$cfg"
+}
+
+###############################################################################
+# repo path resolution
+###############################################################################
+
+# Map a name + kind (formula|cask) to its path inside Homebrew/homebrew-core
+# or Homebrew/homebrew-cask. Casks starting with `font-` live under Casks/font/.
+repo_path_for() {
+    local name="$1" kind="${2:-formula}"
+    local first="${name:0:1}"
+    case "$kind" in
+        formula) printf 'Formula/%s/%s.rb' "$first" "$name" ;;
+        cask)
+            if [[ "$name" == font-* ]]; then
+                printf 'Casks/font/%s.rb' "$name"
+            else
+                printf 'Casks/%s/%s.rb' "$first" "$name"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+###############################################################################
+# github fetch
+###############################################################################
+
+# GET the latest commit on the given file path in the given repo. Sets
+# _latest_commit_iso on success, _error_reason on failure. Returns 0/2.
+fetch_latest_commit_date() {
+    local repo="$1" path="$2"
+    local enc_path
+    enc_path="$(urlencode "$path")"
+    local url="${BC_GITHUB_API}/repos/${repo}/commits?path=${enc_path}&per_page=1"
+
+    local headers=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+    if [[ -n "${BC_TOKEN:-}" ]]; then
+        headers+=(-H "Authorization: Bearer ${BC_TOKEN}")
+    fi
+
+    debug "GET $url"
+
+    local response http_code body
+    if ! response=$(curl -sS --max-time 15 -w $'\n%{http_code}' "${headers[@]}" "$url" 2>&1); then
+        _error_reason="curl error: $(mask_token "$response")"
+        return 2
+    fi
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+    if [[ "$body" == "$response" ]]; then body=""; fi
+
+    case "$http_code" in
+        200) ;;
+        403)
+            if printf '%s' "$body" | jq -e '(.message // "") | test("rate limit"; "i")' >/dev/null 2>&1; then
+                _error_reason="GitHub API rate limit exceeded (HTTP 403). Set BREW_COOLDOWN_GITHUB_TOKEN to raise to 5000/hr."
+            else
+                _error_reason="GitHub HTTP 403 (forbidden) for $path"
+            fi
+            return 2
+            ;;
+        404) _error_reason="formula/cask not found at $repo/$path (HTTP 404)"; return 2 ;;
+        000) _error_reason="curl failed before HTTP exchange (network error)"; return 2 ;;
+        *)   _error_reason="GitHub returned HTTP $http_code for $path"; return 2 ;;
+    esac
+
+    local date_str
+    if ! date_str=$(printf '%s' "$body" | jq -r '.[0].commit.committer.date // empty' 2>/dev/null); then
+        _error_reason="malformed JSON from GitHub"
+        return 2
+    fi
+    if [[ -z "$date_str" ]]; then
+        _error_reason="empty commit list at $path (formula may not exist)"
+        return 2
+    fi
+    _latest_commit_iso="$date_str"
+    return 0
+}
+
+###############################################################################
+# time helpers (cross-platform: GNU date on Linux, BSD date on macOS)
+###############################################################################
+
+iso_to_epoch() {
+    local iso="$1" epoch
+    if epoch=$(date -u -d "$iso" +%s 2>/dev/null); then
+        printf '%s' "$epoch"; return 0
+    fi
+    if epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$iso" +%s 2>/dev/null); then
+        printf '%s' "$epoch"; return 0
+    fi
+    return 1
+}
+
+epoch_now() { date -u +%s; }
+
+age_days() {
+    local iso="$1" then_e now_e
+    then_e=$(iso_to_epoch "$iso") || return 1
+    now_e=$(epoch_now)
+    printf '%d' $(( (now_e - then_e) / 86400 ))
+}
+
+epoch_to_iso() {
+    local e="$1"
+    if date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; then return 0; fi
+    if date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; then return 0; fi
+    return 1
+}
+
+###############################################################################
+# decision
+###############################################################################
+
+# check_cooldown <name> <kind=formula|cask>
+# Returns 0 = eligible, 1 = held, 2 = error (sets _error_reason).
+# Always populates _age_days, _latest_commit_iso, _eligible_at_iso when known.
+check_cooldown() {
+    local name="$1" kind="${2:-formula}"
+    _age_days=""; _eligible_at_iso=""; _latest_commit_iso=""; _error_reason=""
+
+    local repo
+    case "$kind" in
+        formula) repo="$BC_CORE_REPO" ;;
+        cask)    repo="$BC_CASK_REPO" ;;
+        *) _error_reason="unknown kind: $kind"; return 2 ;;
+    esac
+
+    local path
+    if ! path=$(repo_path_for "$name" "$kind"); then
+        _error_reason="cannot determine repo path for $name ($kind)"
+        return 2
+    fi
+
+    if ! fetch_latest_commit_date "$repo" "$path"; then
+        return 2
+    fi
+
+    local age then_epoch eligible_epoch
+    if ! age=$(age_days "$_latest_commit_iso"); then
+        _error_reason="cannot parse commit date: $_latest_commit_iso"
+        return 2
+    fi
+    _age_days="$age"
+    if ! then_epoch=$(iso_to_epoch "$_latest_commit_iso"); then
+        _error_reason="cannot parse commit date: $_latest_commit_iso"
+        return 2
+    fi
+    eligible_epoch=$(( then_epoch + BC_DAYS * 86400 ))
+    if ! _eligible_at_iso=$(epoch_to_iso "$eligible_epoch"); then
+        _eligible_at_iso="(unable to format)"
+    fi
+
+    if (( age >= BC_DAYS )); then
+        return 0
+    else
+        return 1
+    fi
+}
+
+###############################################################################
+# brew invocation (or dry-run print)
+###############################################################################
+
+# Run brew with given args. In dry-run mode, prints the would-run argv to stdout
+# and returns 0. Otherwise execs brew (replacing this shell). We resolve brew's
+# path explicitly via `type -P` to bypass any user alias or function — `exec`
+# itself can't run builtins like `command`, so we resolve to a real path.
+run_brew() {
+    if [[ "${BC_DRY_RUN:-0}" == "1" ]]; then
+        local out="brew"
+        local arg
+        for arg in "$@"; do
+            out="$out $(printf '%q' "$arg")"
+        done
+        printf '%s\n' "$out"
+        return 0
+    fi
+    local brew_bin
+    if ! brew_bin=$(type -P brew); then
+        die 2 "brew not found in PATH; install Homebrew first (https://brew.sh)"
+    fi
+    exec "$brew_bin" "$@"
+}
+
+###############################################################################
+# command implementations
+###############################################################################
+
+# Used by install/upgrade/reinstall when invoked with explicit names.
+run_one_command() {
+    local subcmd="$1"; shift
+    local kind="formula"
+    if [[ "${BC_CASK:-0}" == "1" ]]; then kind="cask"; fi
+
+    if [[ $# -eq 0 ]]; then
+        die 1 "$subcmd requires at least one name"
+    fi
+
+    local n
+    for n in "$@"; do
+        if ! validate_formula_name "$n"; then
+            die 1 "invalid name: '$n' — must match $BC_NAME_RE; third-party taps (user/repo/name) not supported in v1"
+        fi
+    done
+
+    if [[ "${BC_DISABLE:-0}" == "1" ]]; then
+        log_warn "cooldown disabled (--no-cooldown / BREW_COOLDOWN_DISABLE=1); not checking: $*"
+        local pre_args=()
+        if [[ "$kind" == "cask" ]]; then pre_args+=(--cask); fi
+        run_brew "$subcmd" ${pre_args[@]+"${pre_args[@]}"} "$@"
+        return
+    fi
+
+    local survivors=() held=() errored=()
+    for n in "$@"; do
+        local rc=0
+        check_cooldown "$n" "$kind" || rc=$?
+        case "$rc" in
+            0)
+                log_info "$n: eligible (latest commit $_latest_commit_iso, age ${_age_days}d, cooldown ${BC_DAYS}d)"
+                survivors+=("$n")
+                ;;
+            1)
+                log_warn "$n: HELD — latest formula commit $_latest_commit_iso (${_age_days}d ago); eligible after $_eligible_at_iso"
+                held+=("$n")
+                ;;
+            2)
+                if [[ "${BC_FAIL_OPEN:-0}" == "1" ]]; then
+                    log_warn "$n: lookup failed ($_error_reason); BREW_COOLDOWN_FAIL_OPEN=1, letting through"
+                    survivors+=("$n")
+                else
+                    log_error "$n: lookup failed (fail-closed): $_error_reason"
+                    errored+=("$n")
+                fi
+                ;;
+        esac
+    done
+
+    if [[ ${#errored[@]} -gt 0 ]]; then
+        die 2 "fail-closed: refusing to proceed for: ${errored[*]} (override with BREW_COOLDOWN_FAIL_OPEN=1 or --no-cooldown)"
+    fi
+
+    if [[ ${#held[@]} -gt 0 && ${#survivors[@]} -eq 0 ]]; then
+        die 1 "all packages held; bypass with --no-cooldown if intentional"
+    fi
+
+    if [[ ${#held[@]} -gt 0 ]]; then
+        log_warn "held: ${held[*]} — proceeding with: ${survivors[*]}"
+    fi
+
+    if [[ ${#survivors[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    local pre_args=()
+    if [[ "$kind" == "cask" ]]; then pre_args+=(--cask); fi
+    run_brew "$subcmd" ${pre_args[@]+"${pre_args[@]}"} "${survivors[@]}"
+}
+
+cmd_install()   { run_one_command install   "$@"; }
+cmd_reinstall() { run_one_command reinstall "$@"; }
+
+cmd_upgrade() {
+    if [[ $# -gt 0 ]]; then
+        run_one_command upgrade "$@"
+        return
+    fi
+    if [[ "${BC_CASK:-0}" == "1" ]]; then
+        die 1 "'upgrade --cask' without explicit cask names is not supported in v1; specify casks explicitly or use 'brew upgrade --cask' directly"
+    fi
+
+    local outdated_json
+    if ! outdated_json=$(command brew outdated --json=v2 --formula 2>&1); then
+        die 2 "could not run 'brew outdated': $(mask_token "$outdated_json")"
+    fi
+
+    local names
+    if ! names=$(printf '%s' "$outdated_json" | jq -r '.formulae[].name' 2>/dev/null); then
+        die 2 "could not parse 'brew outdated' JSON"
+    fi
+    if [[ -z "$names" ]]; then
+        log_info "nothing to upgrade"
+        return 0
+    fi
+
+    local arr=() n
+    while IFS= read -r n; do
+        if [[ -n "$n" ]]; then arr+=("$n"); fi
+    done <<< "$names"
+
+    if [[ ${#arr[@]} -eq 0 ]]; then
+        log_info "nothing to upgrade"
+        return 0
+    fi
+
+    run_one_command upgrade "${arr[@]}"
+}
+
+###############################################################################
+# usage
+###############################################################################
+
+usage() {
+    cat <<EOF
+brew-cooldown $BC_VERSION — refuse Homebrew install/upgrade/reinstall of any
+formula whose current version landed less than N days ago (default $BC_DEFAULT_DAYS).
+
+USAGE
+  brew-cooldown [GLOBAL FLAGS] <subcommand> [args...]
+
+SUBCOMMANDS (only these — anything else is rejected)
+  install <name>...        install with cooldown check
+  upgrade [<name>...]      upgrade named (or all outdated formulae)
+  reinstall <name>...      reinstall with cooldown check
+
+GLOBAL FLAGS
+  --days N                 cooldown days (overrides env / config)
+  --no-cooldown            disable the check (logs a warning to stderr)
+  --cask                   target a cask instead of a formula
+  --dry-run                print the would-run brew command and exit; do not run brew
+  --debug                  verbose debug output to stderr
+  -h, --help               show this help
+  -v, --version            print version
+
+CONFIG (precedence: flag > env > config file > default)
+  Env: BREW_COOLDOWN_DAYS, BREW_COOLDOWN_GITHUB_TOKEN, BREW_COOLDOWN_FAIL_OPEN,
+       BREW_COOLDOWN_DISABLE, BREW_COOLDOWN_DEBUG
+  File: \${XDG_CONFIG_HOME:-\$HOME/.config}/brew-cooldown/config
+
+See docs/spec.md for behavior, docs/threat-model.md for what's protected.
+EOF
+}
+
+###############################################################################
+# main
+###############################################################################
+
+main() {
+    BC_DAYS=""
+    BC_TOKEN=""
+    BC_FAIL_OPEN=""
+    BC_DISABLE=""
+    BC_DEBUG=""
+    BC_DRY_RUN=0
+    BC_CASK=0
+
+    load_config
+    [[ -n "$_cfg_days" ]]      && BC_DAYS="$_cfg_days"
+    [[ -n "$_cfg_token" ]]     && BC_TOKEN="$_cfg_token"
+    [[ -n "$_cfg_fail_open" ]] && BC_FAIL_OPEN="$_cfg_fail_open"
+    [[ -n "$_cfg_disable" ]]   && BC_DISABLE="$_cfg_disable"
+    [[ -n "$_cfg_debug" ]]     && BC_DEBUG="$_cfg_debug"
+
+    [[ -n "${BREW_COOLDOWN_DAYS:-}" ]]      && BC_DAYS="$BREW_COOLDOWN_DAYS"
+    [[ -n "${BREW_COOLDOWN_GITHUB_TOKEN:-}" ]] && BC_TOKEN="$BREW_COOLDOWN_GITHUB_TOKEN"
+    if [[ -z "$BC_TOKEN" && -n "${HOMEBREW_GITHUB_API_TOKEN:-}" ]]; then
+        BC_TOKEN="$HOMEBREW_GITHUB_API_TOKEN"
+    fi
+    [[ -n "${BREW_COOLDOWN_FAIL_OPEN:-}" ]] && BC_FAIL_OPEN="$BREW_COOLDOWN_FAIL_OPEN"
+    [[ -n "${BREW_COOLDOWN_DISABLE:-}" ]]   && BC_DISABLE="$BREW_COOLDOWN_DISABLE"
+    [[ -n "${BREW_COOLDOWN_DEBUG:-}" ]]     && BC_DEBUG="$BREW_COOLDOWN_DEBUG"
+
+    local positional=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days)
+                if [[ $# -lt 2 ]]; then die 1 "--days requires an argument"; fi
+                if [[ ! "$2" =~ ^[0-9]{1,4}$ ]]; then die 1 "--days must be 1-4 digits (got: $2)"; fi
+                BC_DAYS="$2"; shift 2 ;;
+            --no-cooldown) BC_DISABLE=1; shift ;;
+            --cask)        BC_CASK=1;    shift ;;
+            --dry-run)     BC_DRY_RUN=1; shift ;;
+            --debug)       BC_DEBUG=1;   shift ;;
+            -h|--help)     usage; exit 0 ;;
+            -v|--version)  printf 'brew-cooldown %s\n' "$BC_VERSION"; exit 0 ;;
+            --)
+                shift
+                while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done
+                ;;
+            -*)            die 1 "unknown flag: $1 (try --help)" ;;
+            *)             positional+=("$1"); shift ;;
+        esac
+    done
+
+    [[ -z "$BC_DAYS" ]]      && BC_DAYS="$BC_DEFAULT_DAYS"
+    [[ -z "$BC_FAIL_OPEN" ]] && BC_FAIL_OPEN=0
+    [[ -z "$BC_DISABLE" ]]   && BC_DISABLE=0
+    [[ -z "$BC_DEBUG" ]]     && BC_DEBUG=0
+
+    if [[ ${#positional[@]} -eq 0 ]]; then
+        usage; exit 1
+    fi
+
+    local subcmd="${positional[0]}"
+    local rest=()
+    if [[ ${#positional[@]} -gt 1 ]]; then
+        rest=("${positional[@]:1}")
+    fi
+
+    case "$subcmd" in
+        install)   cmd_install   ${rest[@]+"${rest[@]}"} ;;
+        upgrade)   cmd_upgrade   ${rest[@]+"${rest[@]}"} ;;
+        reinstall) cmd_reinstall ${rest[@]+"${rest[@]}"} ;;
+        *) die 1 "unsupported subcommand: '$subcmd'. Supported: install, upgrade, reinstall. Use 'brew $subcmd ...' directly for anything else." ;;
+    esac
+}
+
+# Lib mode: when sourced from tests with BREW_COOLDOWN_LIB_ONLY=1, define
+# functions only. Otherwise run main.
+if [[ "${BREW_COOLDOWN_LIB_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi

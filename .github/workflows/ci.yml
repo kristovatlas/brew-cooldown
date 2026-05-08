@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (shellcheck + shfmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Install shfmt
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/shfmt" \
+            https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64
+          chmod +x "$RUNNER_TEMP/shfmt"
+          sudo mv "$RUNNER_TEMP/shfmt" /usr/local/bin/shfmt
+      - name: shellcheck
+        run: |
+          shellcheck bin/brew-cooldown install.sh
+          # Test files use bats syntax which shellcheck doesn't fully understand;
+          # we still run with -e to skip irrelevant warnings.
+          shellcheck -e SC2034,SC2016,SC1090,SC1091 tests/test_helper.bash || true
+      - name: shfmt diff (informational)
+        run: |
+          # We don't enforce shfmt in v1; it's run for the diff so reviewers see suggestions.
+          shfmt -d -i 4 -ci bin/brew-cooldown install.sh tests/test_helper.bash || true
+
+  test:
+    name: tests (bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+      - name: Install bats-core
+        run: |
+          git clone --depth 1 --branch v1.11.0 https://github.com/bats-core/bats-core.git "$RUNNER_TEMP/bats"
+          sudo "$RUNNER_TEMP/bats/install.sh" /usr/local
+          bats --version
+      - name: Run bats suite
+        run: bats -r tests/
+
+  smoke:
+    name: smoke install.sh
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (curl + jq required by brew-cooldown)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+      - name: Install via install.sh into a scratch prefix
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          ./install.sh --prefix "$RUNNER_TEMP/bin"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          brew-cooldown --version
+          brew-cooldown --help | head -5
+      - name: Re-run install (idempotency)
+        run: |
+          ./install.sh --prefix "$RUNNER_TEMP/bin"
+      - name: Uninstall
+        run: |
+          ./install.sh --prefix "$RUNNER_TEMP/bin" --uninstall
+          test ! -e "$RUNNER_TEMP/bin/brew-cooldown"
+
+  coverage:
+    name: coverage (kcov)
+    # ubuntu-22.04 (jammy) ships kcov in apt; noble (24.04) dropped it.
+    # Switch back to ubuntu-latest if/when kcov returns, or build from source.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (kcov + jq + curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y kcov jq curl
+      - name: Install bats-core
+        run: |
+          git clone --depth 1 --branch v1.11.0 https://github.com/bats-core/bats-core.git "$RUNNER_TEMP/bats"
+          sudo "$RUNNER_TEMP/bats/install.sh" /usr/local
+          bats --version
+      - name: Run coverage
+        run: ./tests/coverage.sh --ci
+      - name: Upload coverage HTML artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage/
+          retention-days: 14

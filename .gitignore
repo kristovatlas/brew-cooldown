@@ -1,0 +1,21 @@
+.DS_Store
+*.swp
+*.swo
+*~
+
+# bats temp output
+.bats-temp/
+tests/.tmp/
+
+# kcov coverage output
+coverage/
+
+# editor / IDE
+.idea/
+.vscode/
+
+# Claude Code local settings
+.claude/
+
+# local config that should not be checked in
+*.local

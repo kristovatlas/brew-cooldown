@@ -1,0 +1,57 @@
+%% brew-cooldown architecture diagrams (mermaid)
+%% This file is the source-of-truth for the diagrams embedded in docs/architecture.md.
+%% Render with: mmdc -i architecture.mmd -o architecture.svg (or use any mermaid viewer)
+%% --- diagram 1: context ---
+
+flowchart LR
+  user((User)) -->|brew-cooldown install wget| bc[brew-cooldown<br/>bash script]
+  bc -->|HTTPS GET<br/>commits API| gh[(GitHub<br/>api.github.com)]
+  bc -->|reads| cfg[($XDG_CONFIG_HOME/<br/>brew-cooldown/config)]
+  bc -->|reads env| env[(BREW_COOLDOWN_*<br/>env vars)]
+  bc -->|exec brew install ...| brew[(real brew)]
+  brew --> hb[(Homebrew core /<br/>homebrew-cask)]
+
+%% --- diagram 2: sequence (eligible) ---
+
+sequenceDiagram
+  actor User
+  participant BC as brew-cooldown
+  participant GH as GitHub API
+  participant Brew as real brew
+
+  User->>BC: brew-cooldown install wget
+  BC->>BC: validate_formula_name("wget")
+  BC->>BC: load_config + env + flags
+  BC->>GH: GET commits ?path=Formula/w/wget.rb&per_page=1
+  GH-->>BC: 200, commit.committer.date
+  BC->>BC: age_days >= cooldown -> eligible
+  BC->>Brew: exec brew install wget
+  Brew-->>User: real brew output
+
+%% --- diagram 3: sequence (held) ---
+
+sequenceDiagram
+  actor User
+  participant BC as brew-cooldown
+  participant GH as GitHub API
+
+  User->>BC: brew-cooldown upgrade wget
+  BC->>GH: GET commits
+  GH-->>BC: commit date 1 day ago
+  BC-->>User: stderr held + eligibility date; exit 1
+
+%% --- diagram 4: sequence (fail-closed) ---
+
+sequenceDiagram
+  actor User
+  participant BC as brew-cooldown
+  participant GH as GitHub API
+
+  User->>BC: brew-cooldown install wget
+  BC->>GH: GET commits
+  GH--xBC: connection reset
+  alt FAIL_OPEN unset
+    BC-->>User: fail-closed; exit 2
+  else FAIL_OPEN=1
+    BC-->>User: warn + exec brew install wget
+  end
