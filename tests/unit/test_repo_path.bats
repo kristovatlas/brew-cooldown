@@ -15,6 +15,24 @@ teardown() { bc_teardown; }
     [ "$output" = "Formula/g/gcc@13.rb" ]
 }
 
+@test "U-11c: formula starting with 'lib' uses Formula/lib/ subdir" {
+    run repo_path_for "libassuan" "formula"
+    [ "$output" = "Formula/lib/libassuan.rb" ]
+}
+
+@test "U-11d: 'liblinear' (a non-library lib*-named formula) also uses Formula/lib/" {
+    # homebrew-core groups everything matching lib* under Formula/lib/ regardless
+    # of whether it's actually a library — the subdir is a name-prefix convention,
+    # not a semantic one.
+    run repo_path_for "liblinear" "formula"
+    [ "$output" = "Formula/lib/liblinear.rb" ]
+}
+
+@test "U-11e: formula starting with 'l' but not 'lib' uses Formula/l/" {
+    run repo_path_for "lua" "formula"
+    [ "$output" = "Formula/l/lua.rb" ]
+}
+
 @test "U-12: cask path with font- prefix uses Casks/font/" {
     run repo_path_for "font-fira-code" "cask"
     [ "$output" = "Casks/font/font-fira-code.rb" ]

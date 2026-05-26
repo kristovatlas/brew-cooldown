@@ -73,6 +73,9 @@ This is the source of truth for what `brew-cooldown` does. Every row is paired w
 | **U-09** | `load_config` | line `BREW_COOLDOWN_DAYS=14` | sets `_cfg_BREW_COOLDOWN_DAYS=14` |
 | **U-10** | `load_config` | line `EVIL=$(rm -rf /)` | rejected (not in allowlist), no var set |
 | **U-11** | `repo_path_for` | `wget`, `formula` | `Formula/w/wget.rb` |
+| **U-11c** | `repo_path_for` | `libassuan`, `formula` | `Formula/lib/libassuan.rb` — homebrew-core groups all `lib*` formulae under a dedicated `lib/` subdir, parallel to `Casks/font/` for casks |
+| **U-11d** | `repo_path_for` | `liblinear`, `formula` | `Formula/lib/liblinear.rb` — the `lib/` rule is a name-prefix convention, not a "is this a library?" semantic test |
+| **U-11e** | `repo_path_for` | `lua`, `formula` | `Formula/l/lua.rb` — formulae starting with `l` but not `lib` stay in the single-letter subdir |
 | **U-12** | `repo_path_for` | `font-fira-code`, `cask` | `Casks/font/font-fira-code.rb` |
 | **U-13** | `repo_path_for` | `0xed`, `cask` | `Casks/0/0xed.rb` |
 | **U-14** | `find_n_stable_commit` | commits=[(sha=h, t=now-3d), (sha=p, t=now-12d), (sha=q, t=now-30d)], days=7 | returns sha=`p` (gap to next-later h = 9d ≥ 7) |

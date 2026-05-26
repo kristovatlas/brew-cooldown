@@ -176,12 +176,25 @@ load_config() {
 ###############################################################################
 
 # Map a name + kind (formula|cask) to its path inside Homebrew/homebrew-core
-# or Homebrew/homebrew-cask. Casks starting with `font-` live under Casks/font/.
+# or Homebrew/homebrew-cask.
+#
+# Subdir conventions (verified by listing the contents endpoint on the
+# default branch — see U-11d):
+#   formulae starting with `lib`   → Formula/lib/<name>.rb
+#   all other formulae             → Formula/<first>/<name>.rb
+#   casks starting with `font-`    → Casks/font/<name>.rb
+#   all other casks                → Casks/<first>/<name>.rb
 repo_path_for() {
     local name="$1" kind="${2:-formula}"
     local first="${name:0:1}"
     case "$kind" in
-        formula) printf 'Formula/%s/%s.rb' "$first" "$name" ;;
+        formula)
+            if [[ "$name" == lib* ]]; then
+                printf 'Formula/lib/%s.rb' "$name"
+            else
+                printf 'Formula/%s/%s.rb' "$first" "$name"
+            fi
+            ;;
         cask)
             if [[ "$name" == font-* ]]; then
                 printf 'Casks/font/%s.rb' "$name"
