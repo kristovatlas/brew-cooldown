@@ -15,7 +15,9 @@ fi
 
 readonly BC_VERSION="0.1.0"
 readonly BC_DEFAULT_DAYS=7
+readonly BC_DEFAULT_MAX_REWIND_COMMITS=30
 readonly BC_GITHUB_API="https://api.github.com"
+readonly BC_RAW_GITHUB="https://raw.githubusercontent.com"
 readonly BC_CORE_REPO="Homebrew/homebrew-core"
 readonly BC_CASK_REPO="Homebrew/homebrew-cask"
 # Formula/cask names: lowercase letter or digit start; then letters, digits,
@@ -34,6 +36,15 @@ _cfg_token=""
 _cfg_fail_open=""
 _cfg_disable=""
 _cfg_debug=""
+_cfg_no_rewind=""
+_cfg_max_rewind_commits=""
+
+# Rewind path state (per-invocation).
+_rewound_sha=""
+_rewound_iso=""
+_rewound_age_days=""
+_rewind_tap_dir=""
+_rewind_tap_ns=""
 
 ###############################################################################
 # logging / errors
@@ -139,6 +150,18 @@ load_config() {
             BREW_COOLDOWN_DEBUG)
                 if [[ "$value" =~ ^[01]$ ]]; then _cfg_debug="$value"
                 else debug "config $cfg:$lineno BREW_COOLDOWN_DEBUG rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_NO_REWIND)
+                if [[ "$value" =~ ^[01]$ ]]; then _cfg_no_rewind="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_NO_REWIND rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_MAX_REWIND_COMMITS)
+                if [[ "$value" =~ ^[0-9]{1,3}$ ]] && (( value >= 1 && value <= 100 )); then
+                    _cfg_max_rewind_commits="$value"
+                else
+                    debug "config $cfg:$lineno BREW_COOLDOWN_MAX_REWIND_COMMITS rejected (must be 1-100)"
                 fi
                 ;;
             *)
@@ -308,6 +331,221 @@ check_cooldown() {
 }
 
 ###############################################################################
+# N-stable rewind (ADR-0008)
+###############################################################################
+
+# Pure function. Reads lines of "<sha> <iso_date>" sorted newest-first from
+# stdin. Prints "<sha> <iso> <age_days>" for the most recent N-stable commit
+# (per ADR-0008 definition: HEAD with age ≥ N, or non-HEAD with next-later gap
+# ≥ N). Returns 1 if no candidate is N-stable within the input.
+find_n_stable_commit() {
+    local days="$1"
+    local threshold=$(( days * 86400 ))
+    local now_e; now_e=$(epoch_now)
+
+    local shas=() isos=() epochs=()
+    local sha iso epoch line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        sha="${line%% *}"
+        iso="${line#* }"
+        [[ -z "$sha" || -z "$iso" || "$iso" == "$sha" ]] && continue
+        epoch=$(iso_to_epoch "$iso") || continue
+        shas+=("$sha"); isos+=("$iso"); epochs+=("$epoch")
+    done
+
+    local k=${#shas[@]}
+    (( k == 0 )) && return 1
+
+    local i gap age
+    for (( i = 0; i < k; i++ )); do
+        if (( i == 0 )); then
+            gap=$(( now_e - epochs[0] ))
+        else
+            gap=$(( epochs[i-1] - epochs[i] ))
+        fi
+        if (( gap >= threshold )); then
+            age=$(( (now_e - epochs[i]) / 86400 ))
+            printf '%s %s %s\n' "${shas[$i]}" "${isos[$i]}" "$age"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Fetch up to <max_count> recent commits touching <path> in <repo>.
+# Emits one "<sha> <iso_date>" line per commit, newest-first.
+# Sets _error_reason and returns 2 on failure.
+fetch_commits_for_path() {
+    local repo="$1" path="$2" max_count="${3:-30}"
+    local enc_path; enc_path="$(urlencode "$path")"
+    local url="${BC_GITHUB_API}/repos/${repo}/commits?path=${enc_path}&per_page=${max_count}"
+
+    local headers=(-H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+    if [[ -n "${BC_TOKEN:-}" ]]; then
+        headers+=(-H "Authorization: Bearer ${BC_TOKEN}")
+    fi
+
+    debug "GET $url"
+
+    local response http_code body
+    if ! response=$(curl -sS --max-time 15 -w $'\n%{http_code}' "${headers[@]}" "$url" 2>&1); then
+        _error_reason="curl error fetching commits list: $(mask_token "$response")"
+        return 2
+    fi
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+    if [[ "$body" == "$response" ]]; then body=""; fi
+
+    case "$http_code" in
+        200) ;;
+        403)
+            if printf '%s' "$body" | jq -e '(.message // "") | test("rate limit"; "i")' >/dev/null 2>&1; then
+                _error_reason="GitHub API rate limit exceeded for commits list (HTTP 403). Set BREW_COOLDOWN_GITHUB_TOKEN to raise to 5000/hr."
+            else
+                _error_reason="GitHub HTTP 403 (forbidden) for commits list at $path"
+            fi
+            return 2 ;;
+        404) _error_reason="formula not found at $repo/$path (HTTP 404)"; return 2 ;;
+        000) _error_reason="curl failed before HTTP exchange (network error)"; return 2 ;;
+        *)   _error_reason="GitHub returned HTTP $http_code for commits list at $path"; return 2 ;;
+    esac
+
+    local pairs
+    if ! pairs=$(printf '%s' "$body" | jq -r '.[] | "\(.sha) \(.commit.committer.date // "")"' 2>/dev/null); then
+        _error_reason="malformed JSON from commits API"
+        return 2
+    fi
+    if [[ -z "$pairs" ]]; then
+        _error_reason="no commits returned for $path"
+        return 2
+    fi
+    printf '%s\n' "$pairs"
+    return 0
+}
+
+# Fetch the formula .rb content from raw.githubusercontent.com at a specific
+# commit SHA. Returns content on stdout. Sets _error_reason on failure.
+fetch_formula_content() {
+    local repo="$1" path="$2" sha="$3"
+    # SHA is a hex string and path uses safe chars; no urlencoding needed.
+    local url="${BC_RAW_GITHUB}/${repo}/${sha}/${path}"
+
+    debug "GET $url"
+
+    local response http_code body
+    if ! response=$(curl -sS --max-time 15 -w $'\n%{http_code}' "$url" 2>&1); then
+        _error_reason="curl error fetching formula content: $(mask_token "$response")"
+        return 2
+    fi
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+    if [[ "$body" == "$response" ]]; then body=""; fi
+
+    case "$http_code" in
+        200) ;;
+        404) _error_reason="formula content not found at $repo/$path@$sha (HTTP 404)"; return 2 ;;
+        *)   _error_reason="GitHub returned HTTP $http_code fetching formula content"; return 2 ;;
+    esac
+
+    if [[ -z "$body" ]]; then
+        _error_reason="empty formula content at $sha"
+        return 2
+    fi
+    printf '%s' "$body"
+    return 0
+}
+
+# Lazily create a per-invocation tap under $(brew --repository)/Library/Taps/
+# at 0700 perms. Installs an EXIT trap that removes the tap dir.
+# Sets _rewind_tap_dir and _rewind_tap_ns.
+ensure_rewind_tap() {
+    [[ -n "$_rewind_tap_dir" && -d "$_rewind_tap_dir" ]] && return 0
+
+    local repo
+    if ! repo=$(command brew --repository 2>/dev/null); then
+        _error_reason="cannot determine brew --repository for staging tap"
+        return 2
+    fi
+    if [[ -z "$repo" ]]; then
+        _error_reason="empty brew --repository result"
+        return 2
+    fi
+
+    local parent="${repo}/Library/Taps/brew-cooldown"
+    if ! mkdir -p "$parent"; then
+        _error_reason="cannot create $parent"
+        return 2
+    fi
+
+    if ! _rewind_tap_dir=$(mktemp -d "${parent}/homebrew-cooldown-XXXXXX"); then
+        _error_reason="mktemp -d failed for staging tap"
+        return 2
+    fi
+    chmod 700 "$_rewind_tap_dir" 2>/dev/null || true
+    mkdir -p "${_rewind_tap_dir}/Formula"
+
+    local base; base=$(basename "$_rewind_tap_dir")  # homebrew-cooldown-XYZ
+    _rewind_tap_ns="brew-cooldown/${base#homebrew-}" # brew-cooldown/cooldown-XYZ
+
+    trap 'cleanup_rewind_tap' EXIT
+    debug "staged tap at $_rewind_tap_dir (ns $_rewind_tap_ns)"
+    return 0
+}
+
+cleanup_rewind_tap() {
+    if [[ -n "${_rewind_tap_dir:-}" && -d "$_rewind_tap_dir" ]]; then
+        rm -rf "$_rewind_tap_dir"
+    fi
+    _rewind_tap_dir=""
+}
+
+# Write the historical .rb content into the staged tap.
+stage_formula() {
+    local name="$1" content="$2"
+    ensure_rewind_tap || return 2
+
+    local path="${_rewind_tap_dir}/Formula/${name}.rb"
+    if ! printf '%s' "$content" > "$path"; then
+        _error_reason="cannot write staged formula at $path"
+        return 2
+    fi
+    chmod 600 "$path" 2>/dev/null || true
+    return 0
+}
+
+# Combine fetch_commits + find_n_stable. Returns 0 + sets _rewound_sha/iso/age
+# on success, 1 on no N-stable found, 2 on lookup error (sets _error_reason).
+try_rewind() {
+    local name="$1" kind="${2:-formula}"
+    _rewound_sha=""; _rewound_iso=""; _rewound_age_days=""
+
+    # Casks deferred (ADR-0008); fall through to held.
+    [[ "$kind" == "cask" ]] && return 1
+    [[ "$kind" != "formula" ]] && return 1
+
+    local path
+    if ! path=$(repo_path_for "$name" "$kind"); then
+        _error_reason="cannot determine repo path for $name"
+        return 2
+    fi
+
+    local pairs rc=0
+    pairs=$(fetch_commits_for_path "$BC_CORE_REPO" "$path" "$BC_MAX_REWIND_COMMITS") || rc=$?
+    if [[ $rc -ne 0 ]]; then return 2; fi
+
+    local result
+    if ! result=$(printf '%s\n' "$pairs" | find_n_stable_commit "$BC_DAYS"); then
+        return 1
+    fi
+
+    # find_n_stable_commit emits "<sha> <iso> <age_days>" — but the script-wide
+    # IFS=$'\n\t' would otherwise concatenate the three fields into _rewound_sha.
+    IFS=' ' read -r _rewound_sha _rewound_iso _rewound_age_days <<< "$result"
+    [[ -n "$_rewound_sha" ]]
+}
+
+###############################################################################
 # brew invocation (or dry-run print)
 ###############################################################################
 
@@ -330,6 +568,26 @@ run_brew() {
         die 2 "brew not found in PATH; install Homebrew first (https://brew.sh)"
     fi
     exec "$brew_bin" "$@"
+}
+
+# Like run_brew but spawns (doesn't exec). Used for rewound installs where we
+# need to keep running afterward (to clean up the staged tap, or to invoke
+# brew again for the next rewound formula).
+run_brew_spawn() {
+    if [[ "${BC_DRY_RUN:-0}" == "1" ]]; then
+        local out="brew"
+        local arg
+        for arg in "$@"; do
+            out="$out $(printf '%q' "$arg")"
+        done
+        printf '%s\n' "$out"
+        return 0
+    fi
+    local brew_bin
+    if ! brew_bin=$(type -P brew); then
+        die 2 "brew not found in PATH; install Homebrew first (https://brew.sh)"
+    fi
+    "$brew_bin" "$@"
 }
 
 ###############################################################################
@@ -362,6 +620,9 @@ run_one_command() {
     fi
 
     local survivors=() held=() errored=()
+    # Parallel arrays: rewound[] names, rewound_sha[], rewound_age[]. Same index.
+    local rewound=() rewound_sha=() rewound_age=()
+
     for n in "$@"; do
         local rc=0
         check_cooldown "$n" "$kind" || rc=$?
@@ -371,7 +632,31 @@ run_one_command() {
                 survivors+=("$n")
                 ;;
             1)
-                log_warn "$n: HELD — latest formula commit $_latest_commit_iso (${_age_days}d ago); eligible after $_eligible_at_iso"
+                # Try rewind unless opted out or this is a cask (cask rewind deferred to v3).
+                if [[ "${BC_NO_REWIND:-0}" != "1" && "$kind" == "formula" ]]; then
+                    local rwd_rc=0
+                    try_rewind "$n" "$kind" || rwd_rc=$?
+                    if [[ $rwd_rc -eq 0 ]]; then
+                        log_info "$n: HELD at HEAD; rewinding to $_rewound_sha (${_rewound_age_days}d ago, ${_rewound_iso})"
+                        rewound+=("$n")
+                        rewound_sha+=("$_rewound_sha")
+                        rewound_age+=("$_rewound_age_days")
+                        continue
+                    fi
+                    if [[ $rwd_rc -eq 2 ]]; then
+                        if [[ "${BC_FAIL_OPEN:-0}" == "1" ]]; then
+                            log_warn "$n: rewind lookup failed ($_error_reason); BREW_COOLDOWN_FAIL_OPEN=1, letting current HEAD through"
+                            survivors+=("$n")
+                            continue
+                        fi
+                        log_error "$n: rewind lookup failed (fail-closed): $_error_reason"
+                        errored+=("$n")
+                        continue
+                    fi
+                    log_warn "$n: HELD — latest formula commit $_latest_commit_iso (${_age_days}d ago); eligible after $_eligible_at_iso; no N-stable version found within last ${BC_MAX_REWIND_COMMITS} commits"
+                else
+                    log_warn "$n: HELD — latest formula commit $_latest_commit_iso (${_age_days}d ago); eligible after $_eligible_at_iso"
+                fi
                 held+=("$n")
                 ;;
             2)
@@ -390,16 +675,56 @@ run_one_command() {
         die 2 "fail-closed: refusing to proceed for: ${errored[*]} (override with BREW_COOLDOWN_FAIL_OPEN=1 or --no-cooldown)"
     fi
 
-    if [[ ${#held[@]} -gt 0 && ${#survivors[@]} -eq 0 ]]; then
+    if [[ ${#held[@]} -gt 0 && ${#survivors[@]} -eq 0 && ${#rewound[@]} -eq 0 ]]; then
         die 1 "all packages held; bypass with --no-cooldown if intentional"
     fi
 
     if [[ ${#held[@]} -gt 0 ]]; then
-        log_warn "held: ${held[*]} — proceeding with: ${survivors[*]}"
+        local proceed_msg=""
+        [[ ${#survivors[@]} -gt 0 ]] && proceed_msg="proceeding with current: ${survivors[*]}"
+        if [[ ${#rewound[@]} -gt 0 ]]; then
+            [[ -n "$proceed_msg" ]] && proceed_msg="$proceed_msg; "
+            proceed_msg="${proceed_msg}rewinding: ${rewound[*]}"
+        fi
+        log_warn "held: ${held[*]}${proceed_msg:+ — $proceed_msg}"
+    fi
+
+    # Install rewound formulae one at a time (spawn, not exec), so the staged
+    # tap can be cleaned up before we exec for the current-HEAD survivors.
+    if [[ ${#rewound[@]} -gt 0 ]]; then
+        local i
+        for i in "${!rewound[@]}"; do
+            local rn="${rewound[$i]}" rsha="${rewound_sha[$i]}"
+            local rpath; rpath=$(repo_path_for "$rn" "$kind")
+            local rcontent
+            if ! rcontent=$(fetch_formula_content "$BC_CORE_REPO" "$rpath" "$rsha"); then
+                cleanup_rewind_tap
+                die 2 "could not fetch rewound formula content for $rn at $rsha: $_error_reason"
+            fi
+            if ! stage_formula "$rn" "$rcontent"; then
+                cleanup_rewind_tap
+                die 2 "could not stage rewound formula $rn: $_error_reason"
+            fi
+        done
+
+        for i in "${!rewound[@]}"; do
+            local rn="${rewound[$i]}"
+            log_info "$rn: installing rewound version via ${_rewind_tap_ns}/${rn} (--force-bottle)"
+            local rc=0
+            run_brew_spawn "$subcmd" --force-bottle "${_rewind_tap_ns}/${rn}" || rc=$?
+            if [[ $rc -ne 0 ]]; then
+                cleanup_rewind_tap
+                die "$rc" "brew install failed for rewound $rn (rc=$rc) — bottle may be unavailable; raise --days, use --no-rewind, or use --no-cooldown if you've verified"
+            fi
+        done
+
+        # Clean up the staged tap explicitly before exec on normal survivors,
+        # since exec replaces this process and the EXIT trap would not fire.
+        cleanup_rewind_tap
     fi
 
     if [[ ${#survivors[@]} -eq 0 ]]; then
-        return 1
+        return 0
     fi
 
     local pre_args=()
@@ -466,6 +791,7 @@ SUBCOMMANDS (only these — anything else is rejected)
 GLOBAL FLAGS
   --days N                 cooldown days (overrides env / config)
   --no-cooldown            disable the check (logs a warning to stderr)
+  --no-rewind              don't rewind to an N-stable predecessor when held; refuse instead (ADR-0008)
   --cask                   target a cask instead of a formula
   --dry-run                print the would-run brew command and exit; do not run brew
   --debug                  verbose debug output to stderr
@@ -474,7 +800,8 @@ GLOBAL FLAGS
 
 CONFIG (precedence: flag > env > config file > default)
   Env: BREW_COOLDOWN_DAYS, BREW_COOLDOWN_GITHUB_TOKEN, BREW_COOLDOWN_FAIL_OPEN,
-       BREW_COOLDOWN_DISABLE, BREW_COOLDOWN_DEBUG
+       BREW_COOLDOWN_DISABLE, BREW_COOLDOWN_DEBUG, BREW_COOLDOWN_NO_REWIND,
+       BREW_COOLDOWN_MAX_REWIND_COMMITS (default $BC_DEFAULT_MAX_REWIND_COMMITS, range 1-100)
   File: \${XDG_CONFIG_HOME:-\$HOME/.config}/brew-cooldown/config
 
 See docs/spec.md for behavior, docs/threat-model.md for what's protected.
@@ -491,15 +818,19 @@ main() {
     BC_FAIL_OPEN=""
     BC_DISABLE=""
     BC_DEBUG=""
+    BC_NO_REWIND=""
+    BC_MAX_REWIND_COMMITS=""
     BC_DRY_RUN=0
     BC_CASK=0
 
     load_config
-    [[ -n "$_cfg_days" ]]      && BC_DAYS="$_cfg_days"
-    [[ -n "$_cfg_token" ]]     && BC_TOKEN="$_cfg_token"
-    [[ -n "$_cfg_fail_open" ]] && BC_FAIL_OPEN="$_cfg_fail_open"
-    [[ -n "$_cfg_disable" ]]   && BC_DISABLE="$_cfg_disable"
-    [[ -n "$_cfg_debug" ]]     && BC_DEBUG="$_cfg_debug"
+    [[ -n "$_cfg_days" ]]                && BC_DAYS="$_cfg_days"
+    [[ -n "$_cfg_token" ]]               && BC_TOKEN="$_cfg_token"
+    [[ -n "$_cfg_fail_open" ]]           && BC_FAIL_OPEN="$_cfg_fail_open"
+    [[ -n "$_cfg_disable" ]]             && BC_DISABLE="$_cfg_disable"
+    [[ -n "$_cfg_debug" ]]               && BC_DEBUG="$_cfg_debug"
+    [[ -n "$_cfg_no_rewind" ]]           && BC_NO_REWIND="$_cfg_no_rewind"
+    [[ -n "$_cfg_max_rewind_commits" ]]  && BC_MAX_REWIND_COMMITS="$_cfg_max_rewind_commits"
 
     [[ -n "${BREW_COOLDOWN_DAYS:-}" ]]      && BC_DAYS="$BREW_COOLDOWN_DAYS"
     [[ -n "${BREW_COOLDOWN_GITHUB_TOKEN:-}" ]] && BC_TOKEN="$BREW_COOLDOWN_GITHUB_TOKEN"
@@ -509,6 +840,14 @@ main() {
     [[ -n "${BREW_COOLDOWN_FAIL_OPEN:-}" ]] && BC_FAIL_OPEN="$BREW_COOLDOWN_FAIL_OPEN"
     [[ -n "${BREW_COOLDOWN_DISABLE:-}" ]]   && BC_DISABLE="$BREW_COOLDOWN_DISABLE"
     [[ -n "${BREW_COOLDOWN_DEBUG:-}" ]]     && BC_DEBUG="$BREW_COOLDOWN_DEBUG"
+    [[ -n "${BREW_COOLDOWN_NO_REWIND:-}" ]] && BC_NO_REWIND="$BREW_COOLDOWN_NO_REWIND"
+    if [[ -n "${BREW_COOLDOWN_MAX_REWIND_COMMITS:-}" ]]; then
+        if [[ "$BREW_COOLDOWN_MAX_REWIND_COMMITS" =~ ^[0-9]{1,3}$ ]] && (( BREW_COOLDOWN_MAX_REWIND_COMMITS >= 1 && BREW_COOLDOWN_MAX_REWIND_COMMITS <= 100 )); then
+            BC_MAX_REWIND_COMMITS="$BREW_COOLDOWN_MAX_REWIND_COMMITS"
+        else
+            die 1 "BREW_COOLDOWN_MAX_REWIND_COMMITS must be 1-100 (got: $BREW_COOLDOWN_MAX_REWIND_COMMITS)"
+        fi
+    fi
 
     local positional=()
     while [[ $# -gt 0 ]]; do
@@ -518,6 +857,7 @@ main() {
                 if [[ ! "$2" =~ ^[0-9]{1,4}$ ]]; then die 1 "--days must be 1-4 digits (got: $2)"; fi
                 BC_DAYS="$2"; shift 2 ;;
             --no-cooldown) BC_DISABLE=1; shift ;;
+            --no-rewind)   BC_NO_REWIND=1; shift ;;
             --cask)        BC_CASK=1;    shift ;;
             --dry-run)     BC_DRY_RUN=1; shift ;;
             --debug)       BC_DEBUG=1;   shift ;;
@@ -532,10 +872,12 @@ main() {
         esac
     done
 
-    [[ -z "$BC_DAYS" ]]      && BC_DAYS="$BC_DEFAULT_DAYS"
-    [[ -z "$BC_FAIL_OPEN" ]] && BC_FAIL_OPEN=0
-    [[ -z "$BC_DISABLE" ]]   && BC_DISABLE=0
-    [[ -z "$BC_DEBUG" ]]     && BC_DEBUG=0
+    [[ -z "$BC_DAYS" ]]                && BC_DAYS="$BC_DEFAULT_DAYS"
+    [[ -z "$BC_FAIL_OPEN" ]]           && BC_FAIL_OPEN=0
+    [[ -z "$BC_DISABLE" ]]             && BC_DISABLE=0
+    [[ -z "$BC_DEBUG" ]]               && BC_DEBUG=0
+    [[ -z "$BC_NO_REWIND" ]]           && BC_NO_REWIND=0
+    [[ -z "$BC_MAX_REWIND_COMMITS" ]]  && BC_MAX_REWIND_COMMITS="$BC_DEFAULT_MAX_REWIND_COMMITS"
 
     if [[ ${#positional[@]} -eq 0 ]]; then
         usage; exit 1

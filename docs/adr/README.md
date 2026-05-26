@@ -11,6 +11,7 @@ Each ADR captures one decision, the context that drove it, and the trade-offs we
 | [0005](0005-wrapped-subcommand-scope.md) | Wrapped subcommands: install, upgrade, reinstall | Accepted |
 | [0006](0006-no-brew-intercept.md) | We do not replace or shim `brew` | Accepted |
 | [0007](0007-config-precedence.md) | Config precedence and config-file format | Accepted |
+| [0008](0008-rewind-to-n-stable-commit.md) | Rewind to N-stable commit when the latest is held | Accepted |
 
 ## Format
 
