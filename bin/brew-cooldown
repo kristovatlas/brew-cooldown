@@ -15,7 +15,7 @@ fi
 
 readonly BC_VERSION="0.1.0"
 readonly BC_DEFAULT_DAYS=7
-readonly BC_DEFAULT_MAX_REWIND_COMMITS=30
+readonly BC_DEFAULT_MAX_REWIND_COMMITS=100
 readonly BC_GITHUB_API="https://api.github.com"
 readonly BC_RAW_GITHUB="https://raw.githubusercontent.com"
 readonly BC_CORE_REPO="Homebrew/homebrew-core"
@@ -814,7 +814,7 @@ GLOBAL FLAGS
 CONFIG (precedence: flag > env > config file > default)
   Env: BREW_COOLDOWN_DAYS, BREW_COOLDOWN_GITHUB_TOKEN, BREW_COOLDOWN_FAIL_OPEN,
        BREW_COOLDOWN_DISABLE, BREW_COOLDOWN_DEBUG, BREW_COOLDOWN_NO_REWIND,
-       BREW_COOLDOWN_MAX_REWIND_COMMITS (default $BC_DEFAULT_MAX_REWIND_COMMITS, range 1-100)
+       BREW_COOLDOWN_MAX_REWIND_COMMITS (default $BC_DEFAULT_MAX_REWIND_COMMITS, max 100 = GitHub per_page cap)
   File: \${XDG_CONFIG_HOME:-\$HOME/.config}/brew-cooldown/config
 
 See docs/spec.md for behavior, docs/threat-model.md for what's protected.

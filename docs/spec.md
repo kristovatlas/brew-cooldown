@@ -27,7 +27,7 @@ This is the source of truth for what `brew-cooldown` does. Every row is paired w
 | Dry run | off | — | `--dry-run` |
 | Debug log | off | `BREW_COOLDOWN_DEBUG` | `--debug` |
 | Disable rewind (opt-out) | `0` (rewind enabled) | `BREW_COOLDOWN_NO_REWIND` | `--no-rewind` |
-| Max rewind commits | `30` | `BREW_COOLDOWN_MAX_REWIND_COMMITS` | — |
+| Max rewind commits | `100` | `BREW_COOLDOWN_MAX_REWIND_COMMITS` | — |
 
 ## Behavior table (objective)
 
@@ -50,7 +50,7 @@ This is the source of truth for what `brew-cooldown` does. Every row is paired w
 | **S-13** | third-party tap requested (`some-user/tap`) — out of v1 scope | `brew-cooldown install some-user/tap/foo` | exit 1; stderr `third-party taps not supported in v1; use brew directly or wait for a future release` |
 | **S-14** | formula `wget`, HEAD commit 3d ago (not N-stable), prior commit 12d ago (gap 9d ≥ 7), days=7 | `brew-cooldown install wget` | stage prior commit's `.rb` into a per-invocation tap dir; exec `brew install --force-bottle <tap-ns>/<name>/wget`; stderr logs the rewound commit SHA, its age in days, and its ISO committer date |
 | **S-15** | formula `wget`, commit history HEAD=revert 4d ago, prior=malicious 7d ago, prior-prior=legit 27d ago, days=7 | `brew-cooldown install wget` | rewind picks the legit 27d-old commit (not the 7d-old "malicious" one); staged `.rb` content equals the legit commit's content; assert the test harness never sees the malicious commit's content materialized |
-| **S-16** | 30 commits all within last 7d (continuous churn, none N-stable), days=7, `BREW_COOLDOWN_MAX_REWIND_COMMITS=30` | `brew-cooldown install <pkg>` | exit 1; stderr `no N-stable version found within last 30 commits; raise BREW_COOLDOWN_MAX_REWIND_COMMITS, use --no-rewind for eligibility date, or --no-cooldown to bypass`; **no** brew exec |
+| **S-16** | every commit in the last `BC_MAX_REWIND_COMMITS` window has a next-later gap < N days (continuous churn, none N-stable), days=7 | `brew-cooldown install <pkg>` | exit 1; stderr `no N-stable version found within last <max> commits; raise BREW_COOLDOWN_MAX_REWIND_COMMITS, use --no-rewind for eligibility date, or --no-cooldown to bypass`; **no** brew exec |
 | **S-17** | rewind picks N-stable commit C; shimmed brew exits non-zero (simulating missing bottle for user's platform) | `brew-cooldown install wget` | brew is invoked with `install --force-bottle <tap>/wget`; brew-cooldown exits with brew's exit code; **no** source-build is attempted (asserted by the absence of `--build-from-source` in brew's argv and by `--force-bottle` being present) |
 | **S-18** | latest commit 3d ago, N-stable predecessor exists, days=7, `--no-rewind` set | `brew-cooldown install wget` | exit 1; stderr lists the held verdict with eligibility ISO date (today's pre-ADR-0008 behavior); **no** brew exec, **no** staging |
 | **S-19** | `BREW_COOLDOWN_NO_REWIND=1` set via env (no CLI flag) | same scenario as S-18 | identical behavior to S-18 — env var matches CLI flag (config-precedence smoke test for the new setting) |
