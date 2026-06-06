@@ -755,7 +755,12 @@ run_one_command() {
             run_brew_spawn "$subcmd" --force-bottle "${_rewind_tap_ns}/${rn}" || rc=$?
             if [[ $rc -ne 0 ]]; then
                 cleanup_rewind_tap
-                die "$rc" "brew install failed for rewound $rn (rc=$rc) — bottle may be unavailable; raise --days, use --no-rewind, or use --no-cooldown if you've verified"
+                # Don't guess at the cause — brew install can fail for many
+                # reasons (bottle GC'd, dep resolution, link conflict with
+                # another formula, post-install hook). Brew's own output above
+                # describes the actual failure; we just propagate the exit code
+                # and surface the bypass options.
+                die "$rc" "brew install failed for rewound $rn (rc=$rc); see brew's output above for the underlying cause. Bypass options: raise --days for an older candidate, use --no-rewind for held-with-eligibility-date, or --no-cooldown if you have independently verified."
             fi
         done
 
