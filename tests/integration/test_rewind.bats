@@ -173,3 +173,37 @@ teardown() { bc_teardown; }
     # And specifically the values matching our fixture (sha=p, age=12)
     echo "$output" | grep -qE "rewinding to p \(12d ago, "
 }
+
+@test "S-22: rewind candidate found but formula already installed → blocked with remediation" {
+    # Same fixture as S-14: a clean N-stable predecessor (sha=p, age=12) exists.
+    bc_curl_commits_multi h:3 p:12 q:30
+    # …but wget is already installed (e.g. from homebrew/core).
+    bc_mark_installed wget
+
+    run "$BC_SCRIPT" install wget
+    [ "$status" -eq 1 ]
+    # Stderr names the would-be rewound sha + age so the user can judge whether
+    # to uninstall and re-run.
+    echo "$output" | grep -qE "wget: rewind to p \(12d ago, "
+    # And the remediation steps are explicit.
+    echo "$output" | grep -qi "already installed"
+    echo "$output" | grep -q "brew uninstall wget"
+    echo "$output" | grep -q "brew-cooldown install wget"
+    # CRITICAL: no raw fetch, no tap staged, no brew install invoked.
+    ! grep -q "raw.githubusercontent.com" "$BC_CURL_LOG"
+    ! grep -qE "^install " "$BC_BREW_LOG"
+    if [[ -d "${BC_BREW_REPO}/Library/Taps/brew-cooldown" ]]; then
+        ! find "${BC_BREW_REPO}/Library/Taps/brew-cooldown" -maxdepth 1 -name 'homebrew-cooldown-*' | grep -q .
+    fi
+}
+
+@test "S-22b: same as S-22 but formula NOT installed → rewind proceeds normally" {
+    # Regression guard: the pre-flight check must not fire when the formula
+    # isn't installed. Same fixture as S-14, with no bc_mark_installed call.
+    bc_curl_commits_multi h:3 p:12 q:30
+    bc_curl_raw_content "# historical content"
+
+    run "$BC_SCRIPT" install wget
+    [ "$status" -eq 0 ]
+    grep -qE "^install --force-bottle brew-cooldown/cooldown-[A-Za-z0-9]+/wget$" "$BC_BREW_LOG"
+}

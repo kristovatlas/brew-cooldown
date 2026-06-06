@@ -583,6 +583,20 @@ run_brew() {
     exec "$brew_bin" "$@"
 }
 
+# Pre-flight (ADR-0009): is a formula with this name currently installed?
+# brew refuses to install a same-named formula from a different tap when one
+# is already installed; we use this check to bail out of the rewind-via-tap
+# path before staging anything, with a clearer message than brew's. Returns 0
+# if installed (from any tap), 1 if not. Local-only — no network.
+brew_formula_installed() {
+    local name="$1"
+    local brew_bin
+    if ! brew_bin=$(type -P brew); then
+        return 1
+    fi
+    "$brew_bin" list --formula --versions "$name" >/dev/null 2>&1
+}
+
 # Like run_brew but spawns (doesn't exec). Used for rewound installs where we
 # need to keep running afterward (to clean up the staged tap, or to invoke
 # brew again for the next rewound formula).
@@ -650,6 +664,20 @@ run_one_command() {
                     local rwd_rc=0
                     try_rewind "$n" "$kind" || rwd_rc=$?
                     if [[ $rwd_rc -eq 0 ]]; then
+                        # ADR-0009: brew refuses overlapping same-name installs
+                        # across taps. If the formula is already installed, our
+                        # tap-based rewind will fail at brew install time with
+                        # a confusing error. Surface a clear remediation here
+                        # instead, and bail before staging anything.
+                        if brew_formula_installed "$n"; then
+                            log_warn "$n: rewind to $_rewound_sha (${_rewound_age_days}d ago, ${_rewound_iso}) is available but blocked"
+                            log_info "  $n is already installed; brew refuses overlapping same-name installs across taps"
+                            log_info "  to install the cooled version, run:"
+                            log_info "    brew uninstall $n"
+                            log_info "    brew-cooldown install $n"
+                            held+=("$n")
+                            continue
+                        fi
                         log_info "$n: HELD at HEAD; rewinding to $_rewound_sha (${_rewound_age_days}d ago, ${_rewound_iso})"
                         rewound+=("$n")
                         rewound_sha+=("$_rewound_sha")

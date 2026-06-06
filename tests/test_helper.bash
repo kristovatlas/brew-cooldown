@@ -42,6 +42,11 @@ bc_setup() {
     export BC_CURL_COMMITS_FAIL_EXIT="22"
     export BC_BREW_OUTDATED_FILE=""
     export BC_BREW_EXIT="0"
+    # Space-padded list of formula names the brew shim should treat as already
+    # installed for `brew list --formula --versions <name>` queries (ADR-0009).
+    # Format: " name1 name2 name3 " (leading/trailing spaces so word matching
+    # via case patterns is unambiguous).
+    export BC_BREW_INSTALLED_NAMES=""
     # Fake brew repository root, used by ensure_rewind_tap() to find Library/Taps.
     export BC_BREW_REPO="${BC_TMP}/brew-repo"
     mkdir -p "${BC_BREW_REPO}/Library/Taps"
@@ -58,6 +63,17 @@ case "$1" in
     outdated)
         if [[ -n "${BC_BREW_OUTDATED_FILE:-}" ]]; then
             cat "${BC_BREW_OUTDATED_FILE}"
+        fi
+        ;;
+    list)
+        # Recognize `brew list --formula --versions <name>` (ADR-0009 pre-flight).
+        # If <name> is in BC_BREW_INSTALLED_NAMES, exit 0 + emit `<name> 1.0.0`;
+        # otherwise exit 1 like real brew does for an un-installed formula.
+        if [[ "$2" == "--formula" && "$3" == "--versions" && -n "${4:-}" ]]; then
+            case " ${BC_BREW_INSTALLED_NAMES:-} " in
+                *" $4 "*) printf '%s 1.0.0\n' "$4"; exit 0 ;;
+                *)        exit 1 ;;
+            esac
         fi
         ;;
 esac
@@ -119,6 +135,11 @@ CURL_EOF
     unset BREW_COOLDOWN_DAYS BREW_COOLDOWN_GITHUB_TOKEN BREW_COOLDOWN_FAIL_OPEN \
           BREW_COOLDOWN_DISABLE BREW_COOLDOWN_DEBUG HOMEBREW_GITHUB_API_TOKEN \
           BREW_COOLDOWN_NO_REWIND BREW_COOLDOWN_MAX_REWIND_COMMITS
+}
+
+# Helper: mark a list of formula names as already installed (for ADR-0009 tests).
+bc_mark_installed() {
+    export BC_BREW_INSTALLED_NAMES=" $* "
 }
 
 bc_teardown() {
