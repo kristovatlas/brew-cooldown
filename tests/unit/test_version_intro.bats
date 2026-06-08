@@ -98,25 +98,25 @@ vintro_run() {
     [[ "$output" =~ ^a\ .+\ 8$ ]]
 }
 
-@test "U-23: revert-within-hours scenario — V_mal fails lifetime gate, picker chooses V_legit" {
+@test "U-23: revert-within-hours scenario — V_mal fails lifetime gate, picker chooses V_legit (refined: installs from V_legit's LATEST in-V commit ≥N old, not earliest)" {
     # newest-first:
-    #   z (intro V_legit, ~7d ago)  — re-introduction of V_legit
+    #   z (intro V_legit, ~7d ago)  — re-introduction of V_legit (post-revert)
     #   y (intro V_mal,   7d ago)   — malicious intro
     #   x (intro V_legit, 10d ago)  — original V_legit intro
-    # V_mal lifetime = z.date − y.date ≈ 30 min (forced by days=7 vs days=7
-    # adjacency; in real epoch-second terms these are seconds apart in our
-    # test harness because both are computed as "7d ago" → same epoch).
-    # Since both y and z resolve to the same iso (whole-day granularity),
-    # V_mal lifetime ≈ 0s, well below M=1d.
-    # V_legit: intro is `x` at 10d ago, satisfies both gates.
-    # Pick V_legit; install from `x`.
+    # V_mal lifetime = z.date − y.date ≈ 0s (both at same whole-day iso).
+    # V_legit: V_legit has commits z (7d) and x (10d). Under the bottle-
+    # availability refinement, the picker installs from the LATEST in-V
+    # commit that's ≥ N days old → z, not x. z is git-immutable, was at
+    # HEAD continuously from the revert until now, and represents the
+    # post-revert (clean) state. Safe.
     run vintro_run 7 1 wget \
         'z:7:wget 11.5.0' \
         'y:7:wget 11.9.0-mal' \
         'x:10:wget 11.5.0'
     [ "$status" -eq 0 ]
-    # Must pick `x` (legit) — NOT `y` (malicious)
-    [[ "$output" =~ ^x\ .+\ 10$ ]]
+    # Picks V_legit's latest in-V commit ≥7d, which is z (not x)
+    [[ "$output" =~ ^z\ .+\ 7$ ]]
+    # CRITICAL SAFETY: never picks y (the malicious commit)
     [[ ! "$output" =~ ^y\  ]]
 }
 

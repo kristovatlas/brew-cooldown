@@ -578,13 +578,20 @@ parse_commit_version() {
     return 0
 }
 
-# Pure function per ADR-0010. Reads "<sha> <iso> <message_first_line>" lines
-# (newest first) from stdin and applies the version-introduction rule:
+# Pure function per ADR-0010 (as refined for bottle-availability — see
+# ADR-0010 "Revision" section). Reads "<sha> <iso> <message_first_line>"
+# lines (newest first) from stdin and applies the version-introduction rule:
+#
 #   For each unique version V (parsed from commit messages):
 #     gate (a): V's first-introduction (oldest commit with V) is ≥ N days old
 #     gate (b): V's total lifetime as the file's version is ≥ M days
-#   Pick the V with the most recent first-introduction that passes both gates.
-#   Emit "<intro_sha> <intro_iso> <intro_age_days>".
+#   Pick the V with the most recent first-introduction that passes both gates,
+#   then INSTALL from V's **latest in-lifetime commit that's ≥ N days old**
+#   (not from the first-introduction commit). This trades a strict
+#   pin-to-intro property for substantially better bottle availability when
+#   homebrew-core has rebuilt the bottle within the version's lifetime.
+#
+#   Emit "<install_sha> <install_iso> <install_age_days>".
 # Returns 1 if no version is eligible.
 find_version_introduction_eligible() {
     local days_n="$1" days_m="$2" formula="$3"
@@ -627,7 +634,11 @@ find_version_introduction_eligible() {
     # Insertion order = order of first-sighting in newest-first walk, which
     # is exactly the iteration order we want for picking the most-recent
     # eligible version.
-    local unique_vers=() oldest_idx=() total_lifetime=()
+    #
+    # install_idx[v] = index of the LATEST commit with version v that is ≥ N
+    # days old (initialized to -1; first qualifying commit in newest-first
+    # walk IS the latest qualifying one). This is the commit we install from.
+    local unique_vers=() oldest_idx=() install_idx=() total_lifetime=()
     local j found
     for (( i = 0; i < k; i++ )); do
         v="${vers[i]}"
@@ -642,12 +653,24 @@ find_version_introduction_eligible() {
             unique_vers+=("$v")
             oldest_idx+=("$i")
             total_lifetime+=("${head_times[i]}")
+            # First commit seen for this version — is it ≥ N days old?
+            if (( now_e - epochs[i] >= threshold_n )); then
+                install_idx+=("$i")
+            else
+                install_idx+=("-1")
+            fi
         else
             # Older commits have HIGHER index (newest-first array).
             if (( i > oldest_idx[found] )); then
                 oldest_idx[found]=$i
             fi
             total_lifetime[found]=$(( total_lifetime[found] + head_times[i] ))
+            # If we haven't set install_idx for this version yet, and this
+            # commit qualifies, record it (it'll be the newest qualifying
+            # since we're walking newest-first).
+            if (( install_idx[found] == -1 )) && (( now_e - epochs[i] >= threshold_n )); then
+                install_idx[found]=$i
+            fi
         fi
     done
 
@@ -655,23 +678,31 @@ find_version_introduction_eligible() {
     # first one that satisfies both gates. Skip "unknown:*" synthetic versions
     # entirely — they correspond to commits whose messages we couldn't parse,
     # which is exactly the population we conservatively refuse to install from
-    # under ADR-0010 (even if a single such commit individually clears age and
-    # lifetime). Defends against hand-crafted commits with non-standard messages.
+    # (even if a single such commit individually clears age and lifetime).
     local nvers=${#unique_vers[@]}
-    local oidx intro_epoch intro_age lifetime age_days
+    local oidx iidx intro_epoch intro_age lifetime install_epoch install_age age_days
     for (( i = 0; i < nvers; i++ )); do
         case "${unique_vers[i]}" in unknown:*) continue ;; esac
         oidx="${oldest_idx[i]}"
+        iidx="${install_idx[i]}"
         lifetime="${total_lifetime[i]}"
         intro_epoch="${epochs[oidx]}"
         intro_age=$(( now_e - intro_epoch ))
-        # Gate (a): cooldown
+        # Gate (a): cooldown — based on the version's first-introduction
         (( intro_age < threshold_n )) && continue
         # Gate (b): lifetime floor
         (( lifetime < threshold_m )) && continue
-        # Eligible — emit the first-introduction commit's data.
-        age_days=$(( intro_age / 86400 ))
-        printf '%s %s %s\n' "${shas[oidx]}" "${isos[oidx]}" "$age_days"
+        # Must have a qualifying commit to install from. If install_idx is -1
+        # the version has no in-V commit that's ≥ N days old (can happen if
+        # all of V's commits are themselves fresh even though V's intro_age
+        # ≥ N — e.g., V was first seen at an index whose epoch resolves to
+        # a sub-N gap due to clock drift). Defensive skip.
+        (( iidx == -1 )) && continue
+        # Install from the LATEST in-V commit that's ≥ N days old.
+        install_epoch="${epochs[iidx]}"
+        install_age=$(( now_e - install_epoch ))
+        age_days=$(( install_age / 86400 ))
+        printf '%s %s %s\n' "${shas[iidx]}" "${isos[iidx]}" "$age_days"
         return 0
     done
     return 1

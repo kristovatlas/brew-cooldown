@@ -43,55 +43,93 @@ teardown() { bc_teardown; }
     echo "$output" | grep -qE "wget: HELD at HEAD; rewinding to b \(8d ago, "
 }
 
-@test "S-24: revert-within-hours — V_mal fails lifetime gate, picker chooses V_legit, no malicious content fetched" {
+@test "S-23b: bottle-availability win — refined picker installs from the LATEST recognized in-V commit ≥N days old, not the earliest" {
+    # This is the pnpm-shaped scenario the ADR-0010 revision was designed for.
+    # Both the version-bump and the immediately-following bot-rebuild commit
+    # are ≥N=7 days old. Under the refined picker, install_idx is the latest
+    # qualifying commit → `c` (the rebuild), not `b` (the intro). In real
+    # life, `c`'s bottle SHAs are the rebuilt-and-still-hosted ones on
+    # ghcr.io, while `b`'s original bottle SHAs may already have been GC'd.
+    #   d (HEAD, 0d): wget 1.5.0                ← V=1.5.0 fresh
+    #   c (8d): wget: update 1.4.0 bottle.       ← V=1.4.0 rebuild ≥7d
+    #   b (8d): wget 1.4.0                       ← V=1.4.0 intro ≥7d
+    #   a (20d): wget 1.3.0
+    bc_curl_commits_with_messages \
+        'd:0:wget 1.5.0' \
+        'c:8:wget: update 1.4.0 bottle.' \
+        'b:8:wget 1.4.0' \
+        'a:20:wget 1.3.0'
+    bc_curl_raw_content "# V=1.4.0 content at the rebuild commit (newer bottle SHAs)"
+
+    run "$BC_SCRIPT" install wget
+    [ "$status" -eq 0 ]
+    # Refined picker: install from `c` (the rebuild), NOT `b` (the intro)
+    grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/c/Formula/w/wget\.rb" "$BC_CURL_LOG"
+    ! grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/b/" "$BC_CURL_LOG"
+}
+
+@test "S-24: revert-within-hours — V_mal fails lifetime gate, picker chooses V_legit; refined picker installs from the LATEST in-V commit ≥N days old" {
     # Need a fresh HEAD so check_cooldown actually triggers rewind. Timeline:
     #   z   (HEAD, 1d): wget 11.5.0              ← V=11.5.0 (current HEAD, held by cooldown)
     #   z2  (8d):       wget 11.5.0              ← V=11.5.0 (re-intro by revert)
     #   y   (8d):       wget 11.9.0-mal          ← V_mal intro (attacker, same iso as z2 → V_mal lifetime ≈ 0s)
     #   x   (15d):      wget 11.5.0              ← V=11.5.0 (original legitimate intro)
-    # V_mal lifetime = z2.date − y.date ≈ 0 (same whole-day iso). Fails gate (b) under M=1.
-    # V=11.5.0 lifetime = 1d + 7d + 7d ≈ 15d. Intro = `x` at 15d. Both gates satisfied.
-    # Pick V=11.5.0 (most-recent first-sighting in newest-first walk).
-    # Install from `x` — the EARLIEST V=11.5.0 intro, not the re-intro `z2`.
+    # V_mal lifetime ≈ 0 (same whole-day iso as z2). Fails gate (b).
+    # V=11.5.0 lifetime spans the whole window. Intro = `x` at 15d. Both gates pass.
+    # Under the bottle-availability refinement, install from the LATEST in-V
+    # commit ≥ 7d → z2 (8d), NOT x (15d). z2 is git-immutable (post-revert
+    # content, same V_legit but with potentially fresher bottle SHAs from the
+    # revert commit).
     bc_curl_commits_with_messages \
         'z:1:wget 11.5.0' \
         'z2:8:wget 11.5.0' \
         'y:8:wget 11.9.0-mal' \
         'x:15:wget 11.5.0'
-    bc_curl_raw_content "# legit V_legit content at sha x"
+    bc_curl_raw_content "# legit V_legit content (post-revert) at sha z2"
 
     run "$BC_SCRIPT" install wget
     [ "$status" -eq 0 ]
     # CRITICAL SAFETY ASSERTION: never fetch the attacker's commit
     ! grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/y/" "$BC_CURL_LOG"
-    # Did fetch the legit V_legit first-introduction commit (the original, not the re-intro)
-    grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/x/Formula/w/wget\.rb" "$BC_CURL_LOG"
-    # And specifically NOT the re-intro `z2`, which is git-immutable but newer
-    ! grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/z2/" "$BC_CURL_LOG"
+    # Picker installs from z2 (the LATEST V_legit commit ≥7d), not x (oldest)
+    grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/z2/Formula/w/wget\.rb" "$BC_CURL_LOG"
+    # Did NOT fetch x — refined picker prefers the newer in-V commit for
+    # bottle availability
+    ! grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/x/" "$BC_CURL_LOG"
 }
 
-@test "S-25: in-lifetime spoofed bot-rebuild attack — picker installs from version's earliest intro, not the spoofed in-lifetime commit" {
+@test "S-25: fresh in-lifetime spoofed bot-rebuild attack — correctly skipped via cooldown gate; refined picker selects the latest qualifying recognized in-V commit" {
     # newest first:
     #   d (HEAD, 0d): wget 1.5.0                          ← V=1.5.0 (fresh, fails gate a)
-    #   c (3d):       wget: update 1.4.0 bottle.          ← V=1.4.0 (spoofed/attacker)
-    #   b (8d):       wget: update 1.4.0 bottle.          ← V=1.4.0 (also a rebuild-shaped)
+    #   c (3d):       wget: update 1.4.0 bottle.          ← V=1.4.0 (spoofed/attacker, but ≤7d → not eligible)
+    #   b (8d):       wget: update 1.4.0 bottle.          ← V=1.4.0 (legit rebuild ≥7d)
     #   a (10d):      wget 1.4.0                          ← V=1.4.0 intro (legit)
-    # Even though `c` has the recognized rebuild-pattern message and falls
-    # within V=1.4.0's lifetime, the picker pins to `a` (the earliest in-V
-    # commit, which is git-immutable and predates anything `c` could do).
+    # Under the refined picker, V=1.4.0 install candidate is the LATEST in-V
+    # commit ≥7d that has a recognized message → `b` (the legit rebuild).
+    # The attacker commit `c` is correctly skipped because it's 3d old (fails
+    # the cooldown gate). Picking `b` (the rebuild) over `a` (the intro) is
+    # the bottle-availability win — `b`'s bottle SHAs are the rebuilt-and-
+    # still-hosted ones; `a`'s original bottle SHAs may already have been
+    # GC'd by Homebrew's bottle infrastructure.
+    #
+    # **Trade-off this test does NOT exercise**: if the attacker commit `c`
+    # were ≥7d old (older than the cooldown), the refined picker WOULD select
+    # it — that's the Scenario C regression accepted in ADR-0010's revision.
+    # Defense against that case relies on homebrew-core's PR review process
+    # catching malicious content before it ages into the cooldown window.
     bc_curl_commits_with_messages \
         'd:0:wget 1.5.0' \
         'c:3:wget: update 1.4.0 bottle.' \
         'b:8:wget: update 1.4.0 bottle.' \
         'a:10:wget 1.4.0'
-    bc_curl_raw_content "# legit V=1.4.0 intro content at sha a"
+    bc_curl_raw_content "# legit V=1.4.0 rebuild content at sha b"
 
     run "$BC_SCRIPT" install wget
     [ "$status" -eq 0 ]
-    # Must install from `a` (the earliest V=1.4.0 commit), not `c` or `b`
-    grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/a/Formula/w/wget\.rb" "$BC_CURL_LOG"
+    # Picker installs from `b` (latest qualifying recognized in-V commit)
+    grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/b/Formula/w/wget\.rb" "$BC_CURL_LOG"
+    # CRITICAL SAFETY ASSERTION: never fetch `c` (the fresh attacker commit)
     ! grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/c/" "$BC_CURL_LOG"
-    ! grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/b/" "$BC_CURL_LOG"
 }
 
 @test "S-26: unrecognized commit messages — bucketed as unknown:*, conservatively never picked" {

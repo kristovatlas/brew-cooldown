@@ -33,9 +33,7 @@ For each version label V that appears in the formula file's commit history:
    - **(a) Cooldown gate:** V's first-introduction commit is ≥ `N` days old (default `N=7`, from `BC_DAYS`), *and*
    - **(b) Exposure-floor gate:** V's total lifetime is ≥ `M` days (default `M=1`, from `BC_MIN_LIFETIME_DAYS`).
 4. Pick the **most recent eligible V** (most recent first-introduction date among eligible candidates).
-5. **Install from V's first-introduction commit** (not from any subsequent same-version commit).
-
-Step 5 is the critical safety choice. Subsequent commits with the same version label (bottle rebuilds, claimed "minor fixes", etc.) cannot be retroactively edited *by an attacker who has the SHA pinned*, but our tool needs to *choose* a SHA to install — and choosing the introduction commit (the earliest, by date, with version V) is the only choice that is robust against an attacker who lands a malicious commit in V's lifetime spoofing a bot-rebuild message pattern. See "Safety analysis" below for the worked threat scenarios.
+5. **Install from V's latest in-V commit that is itself ≥ N days old and has a recognized message** (per the Revision below). Original intent (preserved as a safety-side-of-the-trade-off) was to pin to V's first-introduction commit; that was refined after a real-world bottle-availability failure on pnpm — see the **Revision** section at the end of this ADR for the full reasoning.
 
 ### Version-label extraction
 
@@ -96,12 +94,17 @@ The exposure-floor gate (b) is what defends against this revert-within-hours pat
 - Day −6: legitimate maintainer reverts
 - Day 0: user runs `brew-cooldown install <pkg>`
 
-- V=11.5.0: first-introduction 10d ago ✓, total lifetime spans the entire 10d period ✓. **Eligible.**
-- **Install from V's first-introduction commit (day −10), NOT from the attacker's day −7 commit.**
+> **Original rule** (pre-Revision, still available via `--strict-cooldown`):
+> - V=11.5.0: first-introduction 10d ago ✓, total lifetime spans the entire 10d period ✓. **Eligible.**
+> - **Install from V's first-introduction commit (day −10), NOT from the attacker's day −7 commit.**
+>
+> Pinning the install to the first-introduction commit defended against this case: even if an attacker landed an in-lifetime modification with a spoofed bottle-rebuild message, the original, pre-attack introduction commit's bytes (git-immutable) were what we installed.
+>
+> **The cost** was: original bottle SHAs only. In practice, on bottle-rebuild-heavy formulae, the original bottle gets replaced on ghcr.io within hours and isn't hosted by the time the cooldown elapses — see the Revision section below.
 
-This is why step 5 of the rule pins the install to the **first-introduction commit** rather than the latest commit with the same version. Even if an attacker landed an in-lifetime modification with a spoofed bottle-rebuild message, we don't install from it — we install from the original, pre-attack introduction commit, which the attacker cannot retroactively edit (git content-addressing).
-
-The cost of this safety choice: we always install with the *original* bottle (the SHAs declared in the introduction commit's `bottle do` block), not any subsequent rebuilds. If those original bottles have been GC'd from ghcr.io, brew refuses cleanly with `CannotInstallFormulaError` (already handled per [ADR-0009](0009-preflight-installed-check.md) and S-17). For recent versions (days to months old) this is rarely a real problem; for very old versions it can be.
+**Under the refined rule** (post-Revision, current default):
+- V=11.5.0 eligibility unchanged.
+- Install commit is the LATEST in-V commit ≥ N days old. In this scenario, the attacker's day −7 commit is ≥ 7 days old, recognized as a rebuild, and within V's lifetime — **it would be selected**. This is the trade-off the Revision accepts: defense against Scenario C now relies on `homebrew-core`'s PR review process catching malicious-content commits before they age past the cooldown. If you specifically want the original first-introduction pin, use `--strict-cooldown` to switch to the ADR-0008 N-stable rule (which picks a different commit by a different rule, but is also commit-immutable and stricter on HEAD-time).
 
 ### Scenario D: patient attacker (non-mitigation #1 reaffirmed)
 
@@ -140,3 +143,39 @@ A malicious version `V_mal` is landed at day 0 and *not* reverted (no maintainer
 
 - The user-experience refinement tracked in [issue #5](https://github.com/kristovatlas/brew-cooldown/issues/5) ("informative-refusal — show smaller-N rewind alternatives") still applies under this rule: if a held formula has no eligible version even under the friendlier default, surface the ladder at smaller `N` so the user can opt into a shorter cooldown per-install.
 - A future ADR could add `--reinstall-via-rewind` (auto-uninstall before installing rewound version) and/or `BREW_COOLDOWN_MIN_DAYS` (auto-relax `N` within a floor). Out of scope here.
+
+## Revision: bottle-availability refinement (post-Mac validation)
+
+The first real-world Mac install attempt of pnpm under this ADR's original "install from V's first-introduction commit" rule **failed** with `brew install` error:
+
+```
+==> Fetching downloads for: pnpm
+Error: Couldn't find manifest matching bottle checksum.
+```
+
+Root cause: BrewTestBot's standard workflow for pnpm-class formulae is a **version-bump commit immediately (within ~1 hour) followed by a bottle-rebuild commit** that updates the `bottle do` block's SHA256s. The original bottle (with the SHAs declared in the first-introduction commit) is replaced on ghcr.io by the rebuilt bottle within hours. By the time the cooldown window elapses (≥7 days later), the **original SHAs are no longer hosted** — only the rebuilt ones are.
+
+The original rule pinned to the first-introduction commit, which references the now-unhosted original SHAs. brew fetched the manifest expecting those SHAs and got the rebuilt one back — checksum mismatch, install fails.
+
+The ADR's "Accepted negatives" section had anticipated this *qualitatively* ("rarely an issue at days-to-months-old introductions") but materially underestimated its **frequency**: on any actively-released formula where BrewTestBot does a post-bump rebuild (which is essentially every popular formula), this triggers the very first time someone tries to install. So "rarely" was wrong; "almost always for popular formulae" is the honest answer.
+
+### Refined rule
+
+For each eligible version `V`, install from the **latest in-V commit that is itself ≥ N days old** (and whose own message is recognized as either an intro or a bot-rebuild of `V`). Both gates are unchanged; only the chosen install commit moves from "earliest in V" to "latest qualifying in V."
+
+### What this preserves
+
+- **Cooldown claim.** The install commit is still git-immutable and still has ≥ N days of presence in the formula's history.
+- **Lifetime gate (b) — Scenario B defense unchanged.** A version introduced and reverted within hours still has total lifetime < `M` and fails gate (b) regardless of which in-V commit we'd install from.
+- **`unknown:*` skip.** Unrecognized-message commits remain conservatively excluded; they cannot be selected as the install commit even if one happens to fall in V's lifetime and clears `N`.
+
+### What this trades away
+
+- **Scenario C defense weakens.** The original rule pinned to the first-introduction commit specifically to defend against an attacker who lands a malicious commit *within V's lifetime* using a spoofed bot-rebuild message pattern. Under the refined rule, if such an attacker commit is itself ≥ N days old, it becomes the install candidate (the latest qualifying in-V commit). Defense against this case now relies on `homebrew-core`'s **PR review process** catching the malicious diff *before* it ages into the cooldown window — the same review-process trust we already implicitly rely on for the cooldown's overall claim per threat-model.md non-mitigation #8.
+- **First-introduction pin no longer a property of the default.** Users who specifically want the strict pin can `--strict-cooldown` to fall back to ADR-0008 N-stable (which also picks a commit-immutable SHA, just by a different rule).
+
+### Why we accepted this trade-off
+
+The bottle-availability failure is a **certainty** for popular formulae (most users would hit it on first try). The Scenario C attack is **possible but requires a meaningful upstream compromise** (either compromising BrewTestBot's automation or fooling a human maintainer reviewer with a deceptive PR). On the cost/benefit axis, "the tool works on real formulae" outweighs "we have a stronger defense against a specific upstream-compromise scenario that's already partly out of our threat model."
+
+threat-model.md's "Defenses specific to ADR-0010 default" section is updated to reflect this.
