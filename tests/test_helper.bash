@@ -134,7 +134,8 @@ CURL_EOF
     # Clear any inherited brew-cooldown env that could pollute tests.
     unset BREW_COOLDOWN_DAYS BREW_COOLDOWN_GITHUB_TOKEN BREW_COOLDOWN_FAIL_OPEN \
           BREW_COOLDOWN_DISABLE BREW_COOLDOWN_DEBUG HOMEBREW_GITHUB_API_TOKEN \
-          BREW_COOLDOWN_NO_REWIND BREW_COOLDOWN_MAX_REWIND_COMMITS
+          BREW_COOLDOWN_NO_REWIND BREW_COOLDOWN_MAX_REWIND_COMMITS \
+          BREW_COOLDOWN_STRICT BREW_COOLDOWN_MIN_LIFETIME_DAYS
 }
 
 # Helper: mark a list of formula names as already installed (for ADR-0009 tests).
@@ -220,4 +221,40 @@ bc_curl_raw_content() {
     printf '%s' "$content" > "$f"
     export BC_CURL_RAW_RESPONSE_FILE="$f"
     export BC_CURL_RAW_HTTP_CODE="200"
+}
+
+# Build a "commits API" fixture body from arg triples "<sha>:<days_ago>:<message>"
+# (newest first). Used by ADR-0010 tests that need control over commit messages.
+# Example:
+#   bc_curl_commits_with_messages \
+#     'c:0:pnpm: update 11.5.2 bottle.' \
+#     'b:0:pnpm 11.5.2' \
+#     'a:8:pnpm 11.4.0'
+# The message can contain colons but the FIRST two colons are the sha:days
+# delimiters (the rest is the message verbatim).
+bc_make_commits_response_with_messages() {
+    local first=1
+    printf '['
+    local triple rest sha days iso message escaped
+    for triple in "$@"; do
+        sha="${triple%%:*}"
+        rest="${triple#*:}"
+        days="${rest%%:*}"
+        message="${rest#*:}"
+        iso=$(bc_iso_days_ago "$days")
+        # Escape backslashes and double-quotes for JSON string embedding.
+        escaped="${message//\\/\\\\}"
+        escaped="${escaped//\"/\\\"}"
+        if [[ $first -eq 1 ]]; then first=0; else printf ','; fi
+        printf '{"sha":"%s","commit":{"committer":{"date":"%s","name":"x","email":"x@x"},"author":{"date":"%s"},"message":"%s"}}' \
+            "$sha" "$iso" "$iso" "$escaped"
+    done
+    printf ']'
+}
+
+bc_curl_commits_with_messages() {
+    local f="${BC_TMP}/commits_with_messages.json"
+    bc_make_commits_response_with_messages "$@" > "$f"
+    export BC_CURL_COMMITS_RESPONSE_FILE="$f"
+    export BC_CURL_COMMITS_HTTP_CODE="200"
 }

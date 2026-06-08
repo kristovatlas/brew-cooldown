@@ -1,6 +1,6 @@
 # ADR-0008: Rewind to N-stable commit when the latest is held
 
-**Status:** Accepted
+**Status:** Accepted (default-on behavior **superseded by [ADR-0010](0010-version-introduction-rewind.md)** after real-world testing showed N-stable rewinds absurdly far on fast-moving formulae; the N-stable rule itself is retained and now available as an opt-in via `--strict-cooldown` / `BREW_COOLDOWN_STRICT=1` for users who want the stronger "this code was the file's HEAD for ≥ N days" claim)
 
 ## Context
 

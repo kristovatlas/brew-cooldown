@@ -12,7 +12,11 @@
 
 load ../test_helper
 
-setup()    { bc_setup; }
+# These rows (S-14-S-22) describe the N-stable rewind path defined in
+# ADR-0008. Per ADR-0010 that rule is now reachable as an opt-in via
+# `--strict-cooldown` / BREW_COOLDOWN_STRICT=1 — exported here so the
+# existing behavior is exercised through that gate.
+setup()    { bc_setup; export BREW_COOLDOWN_STRICT=1; }
 teardown() { bc_teardown; }
 
 @test "S-14: rewind happy path — HEAD held, N-stable predecessor exists, brew called with --force-bottle" {

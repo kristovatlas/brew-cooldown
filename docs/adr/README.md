@@ -13,6 +13,7 @@ Each ADR captures one decision, the context that drove it, and the trade-offs we
 | [0007](0007-config-precedence.md) | Config precedence and config-file format | Accepted |
 | [0008](0008-rewind-to-n-stable-commit.md) | Rewind to N-stable commit when the latest is held | Accepted |
 | [0009](0009-preflight-installed-check.md) | Pre-flight installed-check before staging a rewind tap | Accepted |
+| [0010](0010-version-introduction-rewind.md) | Version-introduction rewind as default; N-stable demoted to opt-in | Accepted |
 
 ## Format
 

@@ -16,6 +16,7 @@ fi
 readonly BC_VERSION="0.1.0"
 readonly BC_DEFAULT_DAYS=7
 readonly BC_DEFAULT_MAX_REWIND_COMMITS=100
+readonly BC_DEFAULT_MIN_LIFETIME_DAYS=1
 readonly BC_GITHUB_API="https://api.github.com"
 readonly BC_RAW_GITHUB="https://raw.githubusercontent.com"
 readonly BC_CORE_REPO="Homebrew/homebrew-core"
@@ -38,6 +39,8 @@ _cfg_disable=""
 _cfg_debug=""
 _cfg_no_rewind=""
 _cfg_max_rewind_commits=""
+_cfg_strict=""
+_cfg_min_lifetime_days=""
 
 # Rewind path state (per-invocation).
 _rewound_sha=""
@@ -162,6 +165,16 @@ load_config() {
                     _cfg_max_rewind_commits="$value"
                 else
                     debug "config $cfg:$lineno BREW_COOLDOWN_MAX_REWIND_COMMITS rejected (must be 1-100)"
+                fi
+                ;;
+            BREW_COOLDOWN_STRICT)
+                if [[ "$value" =~ ^[01]$ ]]; then _cfg_strict="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_STRICT rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_MIN_LIFETIME_DAYS)
+                if [[ "$value" =~ ^[0-9]{1,4}$ ]]; then _cfg_min_lifetime_days="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_MIN_LIFETIME_DAYS rejected"
                 fi
                 ;;
             *)
@@ -347,21 +360,26 @@ check_cooldown() {
 # N-stable rewind (ADR-0008)
 ###############################################################################
 
-# Pure function. Reads lines of "<sha> <iso_date>" sorted newest-first from
-# stdin. Prints "<sha> <iso> <age_days>" for the most recent N-stable commit
-# (per ADR-0008 definition: HEAD with age ≥ N, or non-HEAD with next-later gap
-# ≥ N). Returns 1 if no candidate is N-stable within the input.
+# Pure function. Reads lines of "<sha> <iso_date> [trailing fields...]" sorted
+# newest-first from stdin (trailing fields are ignored; this function only
+# needs sha + iso). Prints "<sha> <iso> <age_days>" for the most recent
+# N-stable commit (per ADR-0008 definition: HEAD with age ≥ N, or non-HEAD
+# with next-later gap ≥ N). Returns 1 if no candidate is N-stable within
+# the input. Available as the --strict-cooldown opt-in per ADR-0010.
 find_n_stable_commit() {
     local days="$1"
     local threshold=$(( days * 86400 ))
     local now_e; now_e=$(epoch_now)
 
     local shas=() isos=() epochs=()
-    local sha iso epoch line
+    local sha iso epoch line rest
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         sha="${line%% *}"
-        iso="${line#* }"
+        rest="${line#* }"
+        # iso is just up to the next space; the third (and any further) fields
+        # are the commit message (used only by ADR-0010's picker, ignored here).
+        iso="${rest%% *}"
         [[ -z "$sha" || -z "$iso" || "$iso" == "$sha" ]] && continue
         epoch=$(iso_to_epoch "$iso") || continue
         shas+=("$sha"); isos+=("$iso"); epochs+=("$epoch")
@@ -387,7 +405,9 @@ find_n_stable_commit() {
 }
 
 # Fetch up to <max_count> recent commits touching <path> in <repo>.
-# Emits one "<sha> <iso_date>" line per commit, newest-first.
+# Emits one "<sha> <iso_date> <message_first_line>" line per commit,
+# newest-first. The message field is used by ADR-0010's
+# find_version_introduction_eligible; find_n_stable_commit ignores it.
 # Sets _error_reason and returns 2 on failure.
 fetch_commits_for_path() {
     local repo="$1" path="$2" max_count="${3:-30}"
@@ -425,7 +445,7 @@ fetch_commits_for_path() {
     esac
 
     local pairs
-    if ! pairs=$(printf '%s' "$body" | jq -r '.[] | "\(.sha) \(.commit.committer.date // "")"' 2>/dev/null); then
+    if ! pairs=$(printf '%s' "$body" | jq -r '.[] | "\(.sha) \(.commit.committer.date // "") \(.commit.message // "" | split("\n") | .[0])"' 2>/dev/null); then
         _error_reason="malformed JSON from commits API"
         return 2
     fi
@@ -527,8 +547,143 @@ stage_formula() {
     return 0
 }
 
-# Combine fetch_commits + find_n_stable. Returns 0 + sets _rewound_sha/iso/age
-# on success, 1 on no N-stable found, 2 on lookup error (sets _error_reason).
+###############################################################################
+# Version-introduction rewind (ADR-0010) — default rule
+###############################################################################
+
+# Parse a commit message into a normalized version identifier.
+# Args: formula_name, sha, message
+# Output (stdout): version string. For recognized BrewTestBot patterns this is
+# the bare version label (e.g. "11.5.0"); for anything unrecognized it is
+# "unknown:<sha>" which is unique per-commit so it can never accumulate into
+# another version's lifetime (fail-closed-friendly).
+parse_commit_version() {
+    local formula="$1" sha="$2" message="$3"
+    # Escape regex metacharacters that can appear in formula names: . and +
+    local fmt="${formula//\\/\\\\}"
+    fmt="${fmt//./\\.}"
+    fmt="${fmt//+/\\+}"
+    # Try rebuild pattern first (more specific): "<formula>: update X.Y.Z bottle."
+    if [[ "$message" =~ ^${fmt}:\ update\ ([0-9][0-9A-Za-z._+~-]*)\ bottle\.$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    # Then intro pattern: "<formula> X.Y.Z"
+    if [[ "$message" =~ ^${fmt}\ ([0-9][0-9A-Za-z._+~-]*)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    # Unrecognized — conservative synthetic version unique to this commit
+    printf 'unknown:%s\n' "$sha"
+    return 0
+}
+
+# Pure function per ADR-0010. Reads "<sha> <iso> <message_first_line>" lines
+# (newest first) from stdin and applies the version-introduction rule:
+#   For each unique version V (parsed from commit messages):
+#     gate (a): V's first-introduction (oldest commit with V) is ≥ N days old
+#     gate (b): V's total lifetime as the file's version is ≥ M days
+#   Pick the V with the most recent first-introduction that passes both gates.
+#   Emit "<intro_sha> <intro_iso> <intro_age_days>".
+# Returns 1 if no version is eligible.
+find_version_introduction_eligible() {
+    local days_n="$1" days_m="$2" formula="$3"
+    local threshold_n=$(( days_n * 86400 ))
+    local threshold_m=$(( days_m * 86400 ))
+    local now_e; now_e=$(epoch_now)
+
+    # Parse stdin into parallel arrays (sha, iso, epoch, version-per-commit).
+    local shas=() isos=() epochs=() vers=()
+    local line sha rest iso message epoch v
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        sha="${line%% *}"
+        rest="${line#* }"
+        iso="${rest%% *}"
+        # If there's no third field, message ends up equal to iso; parser will
+        # treat that as unknown:<sha>, which is the right conservative outcome.
+        message="${rest#* }"
+        [[ -z "$sha" || -z "$iso" || "$iso" == "$sha" ]] && continue
+        epoch=$(iso_to_epoch "$iso") || continue
+        v=$(parse_commit_version "$formula" "$sha" "$message")
+        shas+=("$sha"); isos+=("$iso"); epochs+=("$epoch"); vers+=("$v")
+    done
+
+    local k=${#shas[@]}
+    (( k == 0 )) && return 1
+
+    # Compute HEAD-time for each commit (now or next-newer-commit minus this).
+    local head_times=()
+    local i
+    for (( i = 0; i < k; i++ )); do
+        if (( i == 0 )); then
+            head_times[i]=$(( now_e - epochs[0] ))
+        else
+            head_times[i]=$(( epochs[i-1] - epochs[i] ))
+        fi
+    done
+
+    # Aggregate per unique version (parallel arrays; bash 3.2 has no assoc).
+    # Insertion order = order of first-sighting in newest-first walk, which
+    # is exactly the iteration order we want for picking the most-recent
+    # eligible version.
+    local unique_vers=() oldest_idx=() total_lifetime=()
+    local j found
+    for (( i = 0; i < k; i++ )); do
+        v="${vers[i]}"
+        found=-1
+        for (( j = 0; j < ${#unique_vers[@]}; j++ )); do
+            if [[ "${unique_vers[j]}" == "$v" ]]; then
+                found=$j
+                break
+            fi
+        done
+        if (( found == -1 )); then
+            unique_vers+=("$v")
+            oldest_idx+=("$i")
+            total_lifetime+=("${head_times[i]}")
+        else
+            # Older commits have HIGHER index (newest-first array).
+            if (( i > oldest_idx[found] )); then
+                oldest_idx[found]=$i
+            fi
+            total_lifetime[found]=$(( total_lifetime[found] + head_times[i] ))
+        fi
+    done
+
+    # Iterate versions in their order-of-most-recent-appearance and pick the
+    # first one that satisfies both gates. Skip "unknown:*" synthetic versions
+    # entirely — they correspond to commits whose messages we couldn't parse,
+    # which is exactly the population we conservatively refuse to install from
+    # under ADR-0010 (even if a single such commit individually clears age and
+    # lifetime). Defends against hand-crafted commits with non-standard messages.
+    local nvers=${#unique_vers[@]}
+    local oidx intro_epoch intro_age lifetime age_days
+    for (( i = 0; i < nvers; i++ )); do
+        case "${unique_vers[i]}" in unknown:*) continue ;; esac
+        oidx="${oldest_idx[i]}"
+        lifetime="${total_lifetime[i]}"
+        intro_epoch="${epochs[oidx]}"
+        intro_age=$(( now_e - intro_epoch ))
+        # Gate (a): cooldown
+        (( intro_age < threshold_n )) && continue
+        # Gate (b): lifetime floor
+        (( lifetime < threshold_m )) && continue
+        # Eligible — emit the first-introduction commit's data.
+        age_days=$(( intro_age / 86400 ))
+        printf '%s %s %s\n' "${shas[oidx]}" "${isos[oidx]}" "$age_days"
+        return 0
+    done
+    return 1
+}
+
+###############################################################################
+# Rewind dispatcher
+###############################################################################
+
+# Combine fetch_commits + rule selection (ADR-0010 default vs ADR-0008
+# opt-in). Returns 0 + sets _rewound_sha/iso/age on success, 1 on no eligible
+# version found, 2 on lookup error (sets _error_reason).
 try_rewind() {
     local name="$1" kind="${2:-formula}"
     _rewound_sha=""; _rewound_iso=""; _rewound_age_days=""
@@ -548,12 +703,20 @@ try_rewind() {
     if [[ $rc -ne 0 ]]; then return 2; fi
 
     local result
-    if ! result=$(printf '%s\n' "$pairs" | find_n_stable_commit "$BC_DAYS"); then
-        return 1
+    if [[ "${BC_STRICT:-0}" == "1" ]]; then
+        # Opt-in: ADR-0008 N-stable rule.
+        if ! result=$(printf '%s\n' "$pairs" | find_n_stable_commit "$BC_DAYS"); then
+            return 1
+        fi
+    else
+        # Default: ADR-0010 version-introduction rule.
+        if ! result=$(printf '%s\n' "$pairs" | find_version_introduction_eligible "$BC_DAYS" "$BC_MIN_LIFETIME_DAYS" "$name"); then
+            return 1
+        fi
     fi
 
-    # find_n_stable_commit emits "<sha> <iso> <age_days>" — but the script-wide
-    # IFS=$'\n\t' would otherwise concatenate the three fields into _rewound_sha.
+    # Both pickers emit "<sha> <iso> <age_days>" space-separated; override the
+    # script-wide IFS=$'\n\t' for this one read so we get the right split.
     IFS=' ' read -r _rewound_sha _rewound_iso _rewound_age_days <<< "$result"
     [[ -n "$_rewound_sha" ]]
 }
@@ -837,7 +1000,10 @@ SUBCOMMANDS (only these — anything else is rejected)
 GLOBAL FLAGS
   --days N                 cooldown days (overrides env / config)
   --no-cooldown            disable the check (logs a warning to stderr)
-  --no-rewind              don't rewind to an N-stable predecessor when held; refuse instead (ADR-0008)
+  --no-rewind              don't rewind to an older eligible commit when held; refuse instead
+  --strict-cooldown        use ADR-0008 N-stable rule (commit had ≥N days at HEAD) instead of
+                           ADR-0010 version-introduction default (version label has had ≥N days
+                           of registry presence + ≥M days of lifetime; install from intro commit)
   --cask                   target a cask instead of a formula
   --dry-run                print the would-run brew command and exit; do not run brew
   --debug                  verbose debug output to stderr
@@ -847,7 +1013,8 @@ GLOBAL FLAGS
 CONFIG (precedence: flag > env > config file > default)
   Env: BREW_COOLDOWN_DAYS, BREW_COOLDOWN_GITHUB_TOKEN, BREW_COOLDOWN_FAIL_OPEN,
        BREW_COOLDOWN_DISABLE, BREW_COOLDOWN_DEBUG, BREW_COOLDOWN_NO_REWIND,
-       BREW_COOLDOWN_MAX_REWIND_COMMITS (default $BC_DEFAULT_MAX_REWIND_COMMITS, max 100 = GitHub per_page cap)
+       BREW_COOLDOWN_MAX_REWIND_COMMITS (default $BC_DEFAULT_MAX_REWIND_COMMITS, max 100 = GitHub per_page cap),
+       BREW_COOLDOWN_STRICT, BREW_COOLDOWN_MIN_LIFETIME_DAYS (default $BC_DEFAULT_MIN_LIFETIME_DAYS)
   File: \${XDG_CONFIG_HOME:-\$HOME/.config}/brew-cooldown/config
 
 See docs/spec.md for behavior, docs/threat-model.md for what's protected.
@@ -866,6 +1033,8 @@ main() {
     BC_DEBUG=""
     BC_NO_REWIND=""
     BC_MAX_REWIND_COMMITS=""
+    BC_STRICT=""
+    BC_MIN_LIFETIME_DAYS=""
     BC_DRY_RUN=0
     BC_CASK=0
 
@@ -877,6 +1046,8 @@ main() {
     [[ -n "$_cfg_debug" ]]               && BC_DEBUG="$_cfg_debug"
     [[ -n "$_cfg_no_rewind" ]]           && BC_NO_REWIND="$_cfg_no_rewind"
     [[ -n "$_cfg_max_rewind_commits" ]]  && BC_MAX_REWIND_COMMITS="$_cfg_max_rewind_commits"
+    [[ -n "$_cfg_strict" ]]              && BC_STRICT="$_cfg_strict"
+    [[ -n "$_cfg_min_lifetime_days" ]]   && BC_MIN_LIFETIME_DAYS="$_cfg_min_lifetime_days"
 
     [[ -n "${BREW_COOLDOWN_DAYS:-}" ]]      && BC_DAYS="$BREW_COOLDOWN_DAYS"
     [[ -n "${BREW_COOLDOWN_GITHUB_TOKEN:-}" ]] && BC_TOKEN="$BREW_COOLDOWN_GITHUB_TOKEN"
@@ -894,6 +1065,14 @@ main() {
             die 1 "BREW_COOLDOWN_MAX_REWIND_COMMITS must be 1-100 (got: $BREW_COOLDOWN_MAX_REWIND_COMMITS)"
         fi
     fi
+    [[ -n "${BREW_COOLDOWN_STRICT:-}" ]] && BC_STRICT="$BREW_COOLDOWN_STRICT"
+    if [[ -n "${BREW_COOLDOWN_MIN_LIFETIME_DAYS:-}" ]]; then
+        if [[ "$BREW_COOLDOWN_MIN_LIFETIME_DAYS" =~ ^[0-9]{1,4}$ ]]; then
+            BC_MIN_LIFETIME_DAYS="$BREW_COOLDOWN_MIN_LIFETIME_DAYS"
+        else
+            die 1 "BREW_COOLDOWN_MIN_LIFETIME_DAYS must be a non-negative integer (got: $BREW_COOLDOWN_MIN_LIFETIME_DAYS)"
+        fi
+    fi
 
     local positional=()
     while [[ $# -gt 0 ]]; do
@@ -902,13 +1081,14 @@ main() {
                 if [[ $# -lt 2 ]]; then die 1 "--days requires an argument"; fi
                 if [[ ! "$2" =~ ^[0-9]{1,4}$ ]]; then die 1 "--days must be 1-4 digits (got: $2)"; fi
                 BC_DAYS="$2"; shift 2 ;;
-            --no-cooldown) BC_DISABLE=1; shift ;;
-            --no-rewind)   BC_NO_REWIND=1; shift ;;
-            --cask)        BC_CASK=1;    shift ;;
-            --dry-run)     BC_DRY_RUN=1; shift ;;
-            --debug)       BC_DEBUG=1;   shift ;;
-            -h|--help)     usage; exit 0 ;;
-            -v|--version)  printf 'brew-cooldown %s\n' "$BC_VERSION"; exit 0 ;;
+            --no-cooldown)     BC_DISABLE=1; shift ;;
+            --no-rewind)       BC_NO_REWIND=1; shift ;;
+            --strict-cooldown) BC_STRICT=1; shift ;;
+            --cask)            BC_CASK=1;    shift ;;
+            --dry-run)         BC_DRY_RUN=1; shift ;;
+            --debug)           BC_DEBUG=1;   shift ;;
+            -h|--help)         usage; exit 0 ;;
+            -v|--version)      printf 'brew-cooldown %s\n' "$BC_VERSION"; exit 0 ;;
             --)
                 shift
                 while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done
@@ -924,6 +1104,8 @@ main() {
     [[ -z "$BC_DEBUG" ]]               && BC_DEBUG=0
     [[ -z "$BC_NO_REWIND" ]]           && BC_NO_REWIND=0
     [[ -z "$BC_MAX_REWIND_COMMITS" ]]  && BC_MAX_REWIND_COMMITS="$BC_DEFAULT_MAX_REWIND_COMMITS"
+    [[ -z "$BC_STRICT" ]]              && BC_STRICT=0
+    [[ -z "$BC_MIN_LIFETIME_DAYS" ]]   && BC_MIN_LIFETIME_DAYS="$BC_DEFAULT_MIN_LIFETIME_DAYS"
 
     if [[ ${#positional[@]} -eq 0 ]]; then
         usage; exit 1
