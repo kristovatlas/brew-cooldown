@@ -135,7 +135,14 @@ CURL_EOF
     unset BREW_COOLDOWN_DAYS BREW_COOLDOWN_GITHUB_TOKEN BREW_COOLDOWN_FAIL_OPEN \
           BREW_COOLDOWN_DISABLE BREW_COOLDOWN_DEBUG HOMEBREW_GITHUB_API_TOKEN \
           BREW_COOLDOWN_NO_REWIND BREW_COOLDOWN_MAX_REWIND_COMMITS \
-          BREW_COOLDOWN_STRICT BREW_COOLDOWN_MIN_LIFETIME_DAYS
+          BREW_COOLDOWN_STRICT BREW_COOLDOWN_MIN_LIFETIME_DAYS \
+          BREW_COOLDOWN_NO_COOL_DEPS BREW_COOLDOWN_MAX_DEP_DEPTH \
+          BC_DEP_DEPTH
+    # ADR-0011 transitive-dep cool defaults to ON; opt the existing test
+    # suite out so it continues to exercise only the single-formula path it
+    # was written for. New ADR-0011 integration tests `unset` this in their
+    # setup() to exercise the orchestrator's dep-walking behavior.
+    export BREW_COOLDOWN_NO_COOL_DEPS=1
 }
 
 # Helper: mark a list of formula names as already installed (for ADR-0009 tests).

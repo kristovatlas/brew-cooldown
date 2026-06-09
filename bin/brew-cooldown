@@ -17,6 +17,7 @@ readonly BC_VERSION="0.1.0"
 readonly BC_DEFAULT_DAYS=7
 readonly BC_DEFAULT_MAX_REWIND_COMMITS=100
 readonly BC_DEFAULT_MIN_LIFETIME_DAYS=1
+readonly BC_DEFAULT_MAX_DEP_DEPTH=10
 readonly BC_GITHUB_API="https://api.github.com"
 readonly BC_RAW_GITHUB="https://raw.githubusercontent.com"
 readonly BC_CORE_REPO="Homebrew/homebrew-core"
@@ -41,6 +42,14 @@ _cfg_no_rewind=""
 _cfg_max_rewind_commits=""
 _cfg_strict=""
 _cfg_min_lifetime_days=""
+_cfg_no_cool_deps=""
+_cfg_max_dep_depth=""
+
+# ADR-0011 parser/orchestrator state
+_dep_parse_error=""
+# Path to ourselves, set in main() — used to spawn recursive subprocess
+# invocations to pre-install fresh transitive deps under ADR-0011.
+BC_SELF_PATH=""
 
 # Rewind path state (per-invocation).
 _rewound_sha=""
@@ -175,6 +184,18 @@ load_config() {
             BREW_COOLDOWN_MIN_LIFETIME_DAYS)
                 if [[ "$value" =~ ^[0-9]{1,4}$ ]]; then _cfg_min_lifetime_days="$value"
                 else debug "config $cfg:$lineno BREW_COOLDOWN_MIN_LIFETIME_DAYS rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_NO_COOL_DEPS)
+                if [[ "$value" =~ ^[01]$ ]]; then _cfg_no_cool_deps="$value"
+                else debug "config $cfg:$lineno BREW_COOLDOWN_NO_COOL_DEPS rejected"
+                fi
+                ;;
+            BREW_COOLDOWN_MAX_DEP_DEPTH)
+                if [[ "$value" =~ ^[0-9]{1,2}$ ]] && (( value >= 1 && value <= 50 )); then
+                    _cfg_max_dep_depth="$value"
+                else
+                    debug "config $cfg:$lineno BREW_COOLDOWN_MAX_DEP_DEPTH rejected (must be 1-50)"
                 fi
                 ;;
             *)
@@ -951,6 +972,139 @@ _emit_unique_dep() {
     fi
 }
 
+# Walk a formula's runtime depends_on and pre-install fresh ones via
+# recursive brew-cooldown subprocess invocations. The orchestrator for
+# ADR-0011 Tier 1.
+#
+# Args:
+#   <formula_name>: the formula whose deps we're walking
+#   <source>: "rewound" (read content from the staged tap) or "head" (fetch
+#             current homebrew-core content via raw URL)
+#
+# Returns:
+#   0 — all deps either already-installed-as-is, eligible at current HEAD,
+#       or successfully pre-installed via recursive subprocess
+#   1 — parser failure (sets _dep_parse_error) or recursion-depth bound exceeded
+#   2 — lookup/fetch/subprocess failure (sets _error_reason)
+cool_deps_for_one_formula() {
+    local name="$1" source="$2"
+
+    # Bound recursion depth before doing any work.
+    local depth="${BC_DEP_DEPTH:-0}"
+    if (( depth >= BC_MAX_DEP_DEPTH )); then
+        _error_reason="dep recursion exceeded BC_MAX_DEP_DEPTH=$BC_MAX_DEP_DEPTH (cooling $name at depth $depth); raise BREW_COOLDOWN_MAX_DEP_DEPTH or use --no-cool-deps"
+        return 1
+    fi
+
+    # Get the .rb content to parse.
+    local content
+    case "$source" in
+        rewound)
+            local staged="${_rewind_tap_dir}/Formula/${name}.rb"
+            if [[ ! -f "$staged" ]]; then
+                _error_reason="cool_deps_for_one_formula: staged formula missing at $staged"
+                return 2
+            fi
+            content=$(cat "$staged")
+            ;;
+        head)
+            local rpath
+            if ! rpath=$(repo_path_for "$name" formula); then
+                _error_reason="cool_deps_for_one_formula: cannot resolve path for $name"
+                return 2
+            fi
+            # Fetch raw content at the current default branch.
+            if ! content=$(fetch_formula_content "$BC_CORE_REPO" "$rpath" "HEAD"); then
+                # _error_reason already set
+                return 2
+            fi
+            ;;
+        *)
+            _error_reason="cool_deps_for_one_formula: unknown source '$source'"
+            return 2
+            ;;
+    esac
+
+    # Parse deps from the content.
+    local user_os user_arch
+    user_os=$(detect_user_os)
+    user_arch=$(detect_user_arch)
+    local deps
+    deps=$(parse_depends_on "$content" "$user_os" "$user_arch")
+    local parse_rc=$?
+    if (( parse_rc != 0 )); then
+        _error_reason="depends_on parser failed for $name (use --no-cool-deps to bypass):"$'\n'"$_dep_parse_error"
+        return 1
+    fi
+
+    # For each dep, classify and possibly pre-install.
+    local dep
+    while IFS= read -r dep; do
+        [[ -z "$dep" ]] && continue
+        cool_one_dep "$dep" || return $?
+    done <<< "$deps"
+
+    return 0
+}
+
+# Classify a single dep and pre-install via subprocess if it's fresh.
+# Args: <dep_name>
+# Returns: 0 (handled), 1 (parser/depth failure during recursion), 2 (lookup/install failure)
+cool_one_dep() {
+    local dep="$1"
+
+    # 1. Already installed at any version: firewall, not auditor — skip.
+    if brew_formula_installed "$dep"; then
+        debug "$dep: already installed, skipping (ADR-0011: firewall, not auditor)"
+        return 0
+    fi
+
+    # 2. Not installed: check cooldown on current HEAD to classify.
+    local rc=0
+    check_cooldown "$dep" formula || rc=$?
+    case "$rc" in
+        0)
+            # Eligible at HEAD — brew will install it normally; we don't need to intervene.
+            debug "$dep: not installed, current HEAD eligible (age ${_age_days}d ≥ ${BC_DAYS}d)"
+            return 0
+            ;;
+        1)
+            # Fresh — needs pre-install via recursive subprocess.
+            log_info "$dep: not installed, current HEAD fresh (age ${_age_days}d < ${BC_DAYS}d) — pre-installing via brew-cooldown (ADR-0011)"
+            local new_depth=$((${BC_DEP_DEPTH:-0} + 1))
+            # Propagate relevant configuration to the subprocess as env vars.
+            # CLI flags become env-derived values in the child via the existing
+            # env-loading code in main(). We only set vars whose values differ
+            # from default to keep the child's env clean.
+            local -a env_pairs=("BC_DEP_DEPTH=$new_depth")
+            [[ "$BC_DAYS" != "$BC_DEFAULT_DAYS" ]] && env_pairs+=("BREW_COOLDOWN_DAYS=$BC_DAYS")
+            [[ -n "${BC_TOKEN:-}" ]] && env_pairs+=("BREW_COOLDOWN_GITHUB_TOKEN=$BC_TOKEN")
+            [[ "${BC_FAIL_OPEN:-0}" == "1" ]] && env_pairs+=("BREW_COOLDOWN_FAIL_OPEN=1")
+            [[ "${BC_STRICT:-0}" == "1" ]] && env_pairs+=("BREW_COOLDOWN_STRICT=1")
+            [[ "${BC_NO_REWIND:-0}" == "1" ]] && env_pairs+=("BREW_COOLDOWN_NO_REWIND=1")
+            [[ "${BC_DEBUG:-0}" == "1" ]] && env_pairs+=("BREW_COOLDOWN_DEBUG=1")
+            [[ "${BC_DRY_RUN:-0}" == "1" ]] && env_pairs+=("BC_DRY_RUN=1")
+            [[ "$BC_MAX_REWIND_COMMITS" != "$BC_DEFAULT_MAX_REWIND_COMMITS" ]] && env_pairs+=("BREW_COOLDOWN_MAX_REWIND_COMMITS=$BC_MAX_REWIND_COMMITS")
+            [[ "$BC_MIN_LIFETIME_DAYS" != "$BC_DEFAULT_MIN_LIFETIME_DAYS" ]] && env_pairs+=("BREW_COOLDOWN_MIN_LIFETIME_DAYS=$BC_MIN_LIFETIME_DAYS")
+            [[ "$BC_MAX_DEP_DEPTH" != "$BC_DEFAULT_MAX_DEP_DEPTH" ]] && env_pairs+=("BREW_COOLDOWN_MAX_DEP_DEPTH=$BC_MAX_DEP_DEPTH")
+            if ! env "${env_pairs[@]}" "$BC_SELF_PATH" install "$dep"; then
+                _error_reason="recursive brew-cooldown install failed for transitive dep '$dep' of an ancestor formula"
+                return 2
+            fi
+            return 0
+            ;;
+        2)
+            # Cooldown lookup error.
+            if [[ "${BC_FAIL_OPEN:-0}" == "1" ]]; then
+                log_warn "$dep: cooldown lookup failed ($_error_reason); BREW_COOLDOWN_FAIL_OPEN=1, letting brew install it ungated"
+                return 0
+            fi
+            _error_reason="cool_one_dep: cooldown lookup failed for dep '$dep' (fail-closed): $_error_reason"
+            return 2
+            ;;
+    esac
+}
+
 ###############################################################################
 # brew invocation (or dry-run print)
 ###############################################################################
@@ -1123,8 +1277,8 @@ run_one_command() {
         log_warn "held: ${held[*]}${proceed_msg:+ — $proceed_msg}"
     fi
 
-    # Install rewound formulae one at a time (spawn, not exec), so the staged
-    # tap can be cleaned up before we exec for the current-HEAD survivors.
+    # Stage rewound formulae first (their content needs to be on disk before
+    # we can parse their depends_on for ADR-0011's dep walk).
     if [[ ${#rewound[@]} -gt 0 ]]; then
         local i
         for i in "${!rewound[@]}"; do
@@ -1140,7 +1294,38 @@ run_one_command() {
                 die 2 "could not stage rewound formula $rn: $_error_reason"
             fi
         done
+    fi
 
+    # ADR-0011: walk deps of every formula we're about to install and
+    # pre-cool any fresh transitive deps before invoking brew. Skipped
+    # entirely when --no-cool-deps / BREW_COOLDOWN_NO_COOL_DEPS=1, or for
+    # casks (cask dep handling deferred along with cask rewind support).
+    if [[ "${BC_NO_COOL_DEPS:-0}" != "1" && "$kind" == "formula" ]]; then
+        local _n
+        # Rewound formulae: parse from the staged .rb (already on disk above)
+        for _n in "${rewound[@]+"${rewound[@]}"}"; do
+            local _rc=0
+            cool_deps_for_one_formula "$_n" rewound || _rc=$?
+            if [[ $_rc -ne 0 ]]; then
+                cleanup_rewind_tap
+                die "$_rc" "transitive dep cool failed for $_n (--no-cool-deps to bypass): $_error_reason"
+            fi
+        done
+        # Survivors (current HEAD eligible): fetch HEAD content for parsing
+        for _n in "${survivors[@]+"${survivors[@]}"}"; do
+            local _rc=0
+            cool_deps_for_one_formula "$_n" head || _rc=$?
+            if [[ $_rc -ne 0 ]]; then
+                cleanup_rewind_tap
+                die "$_rc" "transitive dep cool failed for $_n (--no-cool-deps to bypass): $_error_reason"
+            fi
+        done
+    fi
+
+    # Install rewound formulae one at a time (spawn, not exec), so the staged
+    # tap can be cleaned up before we exec for the current-HEAD survivors.
+    if [[ ${#rewound[@]} -gt 0 ]]; then
+        local i
         for i in "${!rewound[@]}"; do
             local rn="${rewound[$i]}"
             log_info "$rn: installing rewound version via ${_rewind_tap_ns}/${rn} (--force-bottle)"
@@ -1234,6 +1419,9 @@ GLOBAL FLAGS
   --strict-cooldown        use ADR-0008 N-stable rule (commit had ≥N days at HEAD) instead of
                            ADR-0010 version-introduction default (version label has had ≥N days
                            of registry presence + ≥M days of lifetime; install from intro commit)
+  --no-cool-deps           don't recursively cool transitive deps (ADR-0011); only gate the
+                           specifically-named top-level formula. Useful when a formula's
+                           depends_on contains conditional Ruby our parser can't safely interpret
   --cask                   target a cask instead of a formula
   --dry-run                print the would-run brew command and exit; do not run brew
   --debug                  verbose debug output to stderr
@@ -1244,7 +1432,8 @@ CONFIG (precedence: flag > env > config file > default)
   Env: BREW_COOLDOWN_DAYS, BREW_COOLDOWN_GITHUB_TOKEN, BREW_COOLDOWN_FAIL_OPEN,
        BREW_COOLDOWN_DISABLE, BREW_COOLDOWN_DEBUG, BREW_COOLDOWN_NO_REWIND,
        BREW_COOLDOWN_MAX_REWIND_COMMITS (default $BC_DEFAULT_MAX_REWIND_COMMITS, max 100 = GitHub per_page cap),
-       BREW_COOLDOWN_STRICT, BREW_COOLDOWN_MIN_LIFETIME_DAYS (default $BC_DEFAULT_MIN_LIFETIME_DAYS)
+       BREW_COOLDOWN_STRICT, BREW_COOLDOWN_MIN_LIFETIME_DAYS (default $BC_DEFAULT_MIN_LIFETIME_DAYS),
+       BREW_COOLDOWN_NO_COOL_DEPS, BREW_COOLDOWN_MAX_DEP_DEPTH (default $BC_DEFAULT_MAX_DEP_DEPTH, range 1-50)
   File: \${XDG_CONFIG_HOME:-\$HOME/.config}/brew-cooldown/config
 
 See docs/spec.md for behavior, docs/threat-model.md for what's protected.
@@ -1265,8 +1454,21 @@ main() {
     BC_MAX_REWIND_COMMITS=""
     BC_STRICT=""
     BC_MIN_LIFETIME_DAYS=""
+    BC_NO_COOL_DEPS=""
+    BC_MAX_DEP_DEPTH=""
     BC_DRY_RUN=0
     BC_CASK=0
+
+    # Record our own path for subprocess recursion (ADR-0011 cool_one_dep).
+    # BASH_SOURCE[0] is reliable both when run directly and when sourced
+    # from a wrapper script.
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        BC_SELF_PATH="${BASH_SOURCE[0]}"
+    elif [[ -n "${0:-}" && -f "${0}" ]]; then
+        BC_SELF_PATH="${0}"
+    else
+        BC_SELF_PATH="brew-cooldown"
+    fi
 
     load_config
     [[ -n "$_cfg_days" ]]                && BC_DAYS="$_cfg_days"
@@ -1278,6 +1480,8 @@ main() {
     [[ -n "$_cfg_max_rewind_commits" ]]  && BC_MAX_REWIND_COMMITS="$_cfg_max_rewind_commits"
     [[ -n "$_cfg_strict" ]]              && BC_STRICT="$_cfg_strict"
     [[ -n "$_cfg_min_lifetime_days" ]]   && BC_MIN_LIFETIME_DAYS="$_cfg_min_lifetime_days"
+    [[ -n "$_cfg_no_cool_deps" ]]        && BC_NO_COOL_DEPS="$_cfg_no_cool_deps"
+    [[ -n "$_cfg_max_dep_depth" ]]       && BC_MAX_DEP_DEPTH="$_cfg_max_dep_depth"
 
     [[ -n "${BREW_COOLDOWN_DAYS:-}" ]]      && BC_DAYS="$BREW_COOLDOWN_DAYS"
     [[ -n "${BREW_COOLDOWN_GITHUB_TOKEN:-}" ]] && BC_TOKEN="$BREW_COOLDOWN_GITHUB_TOKEN"
@@ -1303,6 +1507,14 @@ main() {
             die 1 "BREW_COOLDOWN_MIN_LIFETIME_DAYS must be a non-negative integer (got: $BREW_COOLDOWN_MIN_LIFETIME_DAYS)"
         fi
     fi
+    [[ -n "${BREW_COOLDOWN_NO_COOL_DEPS:-}" ]] && BC_NO_COOL_DEPS="$BREW_COOLDOWN_NO_COOL_DEPS"
+    if [[ -n "${BREW_COOLDOWN_MAX_DEP_DEPTH:-}" ]]; then
+        if [[ "$BREW_COOLDOWN_MAX_DEP_DEPTH" =~ ^[0-9]{1,2}$ ]] && (( BREW_COOLDOWN_MAX_DEP_DEPTH >= 1 && BREW_COOLDOWN_MAX_DEP_DEPTH <= 50 )); then
+            BC_MAX_DEP_DEPTH="$BREW_COOLDOWN_MAX_DEP_DEPTH"
+        else
+            die 1 "BREW_COOLDOWN_MAX_DEP_DEPTH must be 1-50 (got: $BREW_COOLDOWN_MAX_DEP_DEPTH)"
+        fi
+    fi
 
     local positional=()
     while [[ $# -gt 0 ]]; do
@@ -1314,6 +1526,7 @@ main() {
             --no-cooldown)     BC_DISABLE=1; shift ;;
             --no-rewind)       BC_NO_REWIND=1; shift ;;
             --strict-cooldown) BC_STRICT=1; shift ;;
+            --no-cool-deps)    BC_NO_COOL_DEPS=1; shift ;;
             --cask)            BC_CASK=1;    shift ;;
             --dry-run)         BC_DRY_RUN=1; shift ;;
             --debug)           BC_DEBUG=1;   shift ;;
@@ -1336,6 +1549,8 @@ main() {
     [[ -z "$BC_MAX_REWIND_COMMITS" ]]  && BC_MAX_REWIND_COMMITS="$BC_DEFAULT_MAX_REWIND_COMMITS"
     [[ -z "$BC_STRICT" ]]              && BC_STRICT=0
     [[ -z "$BC_MIN_LIFETIME_DAYS" ]]   && BC_MIN_LIFETIME_DAYS="$BC_DEFAULT_MIN_LIFETIME_DAYS"
+    [[ -z "$BC_NO_COOL_DEPS" ]]        && BC_NO_COOL_DEPS=0
+    [[ -z "$BC_MAX_DEP_DEPTH" ]]       && BC_MAX_DEP_DEPTH="$BC_DEFAULT_MAX_DEP_DEPTH"
 
     if [[ ${#positional[@]} -eq 0 ]]; then
         usage; exit 1
