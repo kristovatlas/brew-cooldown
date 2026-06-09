@@ -113,6 +113,7 @@ Tier 2 is documented as a future possible extension in the "Alternatives conside
 
 ## Forward references
 
+- **Compatibility-upgrade detection (deferred from v1).** Detecting when brew would transparently upgrade an installed dep as part of the top-level install — by parsing `brew install --dry-run` output — was specified in S-32 but is deferred. Currently if brew upgrades an installed dep mid-install, that upgrade bypasses the cooldown. User remediation: `brew-cooldown install <dep>` explicitly before the top-level when the user suspects an upgrade will happen.
 - A future iteration could add a `--cool-deps-depth=N` flag to tune the recursion depth, or a `--cool-deps-only=<list>` for users who want to selectively gate specific deps.
 - The Tier 2 path (full graph cool with pnpm-style semantics) is documented in this ADR's "Alternatives considered" as a future possible extension if a use case justifies the scope expansion.
 - Issue [#5](https://github.com/kristovatlas/brew-cooldown/issues/5) ("informative-refusal — show smaller-N rewind alternatives") still applies to each per-dep cooldown decision under this rule.
