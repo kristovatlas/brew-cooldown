@@ -80,10 +80,11 @@ esac
 exit "${BC_BREW_EXIT:-0}"
 BREW_EOF
     chmod +x "${BC_SHIM}/brew"
-    # Shimmed curl: log argv, choose a fixture by URL host:
-    #   api.github.com       → BC_CURL_COMMITS_RESPONSE_FILE (falls back to BC_CURL_RESPONSE_FILE)
-    #   raw.githubusercontent → BC_CURL_RAW_RESPONSE_FILE     (no fallback — must be set)
-    #   otherwise            → BC_CURL_RESPONSE_FILE
+    # Shimmed curl: log argv, choose a fixture in priority order:
+    #   1. Per-formula fixture file at ${BC_TMP}/fixtures/{commits,raw}/<name>.{json,rb}
+    #      (extracted from the URL — Formula/X/<name>.rb path segment)
+    #   2. BC_CURL_RAW_RESPONSE_FILE / BC_CURL_COMMITS_RESPONSE_FILE (legacy single-fixture mode)
+    #   3. BC_CURL_RESPONSE_FILE (universal fallback)
     cat > "${BC_SHIM}/curl" <<'CURL_EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${BC_CURL_LOG:-/dev/null}"
@@ -91,11 +92,28 @@ url=""
 for a in "$@"; do
     case "$a" in https://*|http://*) url="$a" ;; esac
 done
+
+# Extract formula name from URL for per-formula fixture routing (ADR-0011).
+fname=""
+case "$url" in
+    *api.github.com*Formula*)
+        # ".../commits?path=Formula/p/python%403.14.rb&per_page=..."
+        fname=$(printf '%s' "$url" | sed -E 's|.*path=Formula/[^/]+/||; s|\.rb.*||; s|%40|@|g')
+        ;;
+    *raw.githubusercontent.com*Formula*)
+        # ".../<sha>/Formula/p/python@3.14.rb"
+        fname=$(printf '%s' "$url" | sed -E 's|.*/Formula/[^/]+/||; s|\.rb$||')
+        ;;
+esac
+
 body_file="${BC_CURL_RESPONSE_FILE:-}"
 http_code="${BC_CURL_HTTP_CODE:-200}"
 case "$url" in
     *raw.githubusercontent.com*)
-        if [[ -n "${BC_CURL_RAW_RESPONSE_FILE:-}" ]]; then
+        per_f="${BC_TMP:-/tmp}/fixtures/raw/${fname}.rb"
+        if [[ -n "$fname" && -f "$per_f" ]]; then
+            body_file="$per_f"; http_code="200"
+        elif [[ -n "${BC_CURL_RAW_RESPONSE_FILE:-}" ]]; then
             body_file="${BC_CURL_RAW_RESPONSE_FILE}"
             http_code="${BC_CURL_RAW_HTTP_CODE:-200}"
         else
@@ -112,7 +130,10 @@ case "$url" in
                 exit "${BC_CURL_COMMITS_FAIL_EXIT:-22}"
             fi
         fi
-        if [[ -n "${BC_CURL_COMMITS_RESPONSE_FILE:-}" ]]; then
+        per_f="${BC_TMP:-/tmp}/fixtures/commits/${fname}.json"
+        if [[ -n "$fname" && -f "$per_f" ]]; then
+            body_file="$per_f"; http_code="200"
+        elif [[ -n "${BC_CURL_COMMITS_RESPONSE_FILE:-}" ]]; then
             body_file="${BC_CURL_COMMITS_RESPONSE_FILE}"
             http_code="${BC_CURL_COMMITS_HTTP_CODE:-200}"
         fi
@@ -125,6 +146,8 @@ fi
 exit "${BC_CURL_EXIT:-0}"
 CURL_EOF
     chmod +x "${BC_SHIM}/curl"
+    # Per-formula fixture directories for ADR-0011 multi-formula tests
+    mkdir -p "${BC_TMP}/fixtures/commits" "${BC_TMP}/fixtures/raw"
     # Prepend shim dir to PATH so `command brew` and curl pick it up.
     export PATH="${BC_SHIM}:${PATH}"
     # Isolate config: point XDG_CONFIG_HOME at the empty tmp dir so prod config
@@ -264,4 +287,27 @@ bc_curl_commits_with_messages() {
     bc_make_commits_response_with_messages "$@" > "$f"
     export BC_CURL_COMMITS_RESPONSE_FILE="$f"
     export BC_CURL_COMMITS_HTTP_CODE="200"
+}
+
+# ADR-0011 per-formula fixture helpers. Used by integration tests that need
+# to simulate a multi-formula dep tree — each formula gets its own commits
+# API response and (optionally) its own raw .rb content.
+# The curl shim routes URL → per-formula file by parsing the formula name
+# out of the URL path (Formula/X/<name>.rb).
+
+# Set the commits-API response for a specific formula.
+# Args: <formula_name> <"sha:days_ago[:message]" triples ...>
+# Example: bc_set_commits_for python@3.14 h:3:'python@3.14 3.14.2_1' p:8:'python@3.14 3.14.2'
+bc_set_commits_for() {
+    local name="$1"; shift
+    local f="${BC_TMP}/fixtures/commits/${name}.json"
+    bc_make_commits_response_with_messages "$@" > "$f"
+}
+
+# Set the raw .rb content for a specific formula.
+# Args: <formula_name> <content>
+bc_set_raw_for() {
+    local name="$1" content="$2"
+    local f="${BC_TMP}/fixtures/raw/${name}.rb"
+    printf '%s' "$content" > "$f"
 }
