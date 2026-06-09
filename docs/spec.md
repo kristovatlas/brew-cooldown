@@ -30,6 +30,8 @@ This is the source of truth for what `brew-cooldown` does. Every row is paired w
 | Max rewind commits | `100` | `BREW_COOLDOWN_MAX_REWIND_COMMITS` | — |
 | Strict cooldown (use [ADR-0008](adr/0008-rewind-to-n-stable-commit.md) N-stable rule instead of [ADR-0010](adr/0010-version-introduction-rewind.md) version-introduction default) | `0` (off) | `BREW_COOLDOWN_STRICT` | `--strict-cooldown` |
 | Min version-lifetime days (ADR-0010 gate (b) floor) | `1` | `BREW_COOLDOWN_MIN_LIFETIME_DAYS` | — |
+| Disable transitive-dep cooldown (opt out of [ADR-0011](adr/0011-transitive-dep-cool.md) Tier 1) | `0` (deps cooled) | `BREW_COOLDOWN_NO_COOL_DEPS` | `--no-cool-deps` |
+| Max dep-tree recursion depth (ADR-0011) | `10` | `BREW_COOLDOWN_MAX_DEP_DEPTH` | — |
 
 ## Behavior table (objective)
 
@@ -76,6 +78,18 @@ This is the source of truth for what `brew-cooldown` does. Every row is paired w
 | **S-28** | same setup as S-27, but `BREW_COOLDOWN_STRICT=1` env var set instead of the CLI flag | `brew-cooldown install wget` | identical behavior to S-27 — env var matches CLI flag |
 | **S-29** | held formula has *no* eligible version under the default ADR-0010 rule (e.g., very-recent introductions only, none past the cooldown), and `--strict-cooldown` not set | `brew-cooldown install wget` | exit 1; stderr names the most-recent introduced version, its age, and explains that it fails gate (a) (cooldown) or gate (b) (lifetime); suggests `--strict-cooldown` as a fallback if a deeper rewind is acceptable, and the existing bypass options (`--no-rewind`, `--no-cooldown`) |
 
+### ADR-0011 transitive dependency cooldown (Tier 1, default-on with `--no-cool-deps` opt-out)
+
+| ID | Given | When | Then |
+|---|---|---|---|
+| **S-30** | top-level `awscli` eligible at HEAD or rewound successfully; its `depends_on` lists `openssl@3` (already installed at version `X`, brew would use it as-is) and `python@3.14` (not installed; current HEAD is 9d old, eligible by itself) | `brew-cooldown install awscli` | dep walk recognizes `openssl@3` as already-installed → no action; `python@3.14` as not-installed-but-eligible → no pre-install needed (brew will install eligible-current normally); `brew install awscli` proceeds; exit 0 |
+| **S-31** | top-level held + rewound; one transitive dep (`python@3.14`) is not installed AND current HEAD is fresh (<N days) | `brew-cooldown install awscli` | before the top-level install, brew-cooldown recursively invokes itself for `python@3.14` (cool + rewind decision per ADR-0010); on success, proceeds with `brew install` of awscli (which then uses the pre-cooled `python@3.14` brew sees installed); exit 0 |
+| **S-32** | a transitive dep already installed at version `V` but the top-level install would `brew upgrade` it to version `W` (compatibility plan from `brew install --dry-run`) | `brew-cooldown install awscli` | brew-cooldown treats the upgrade target `W` as "new install" — pre-installs `W` via brew-cooldown first, applying the cooldown decision; only then proceeds with top-level install |
+| **S-33** | top-level's `depends_on` includes an unparseable line (e.g., `depends_on "llvm" => :build if DevelopmentTools.clang_build_version <= 1699`) | `brew-cooldown install <pkg>` | exit 1; stderr names the unparseable line and its file location; suggests `--no-cool-deps` for this specific install if the user accepts the gap; **no** brew exec, **no** transitive pre-installs attempted |
+| **S-34** | same scenario as S-33, but `--no-cool-deps` (or `BREW_COOLDOWN_NO_COOL_DEPS=1`) set | `brew-cooldown --no-cool-deps install <pkg>` | dep walk is skipped entirely; top-level install proceeds as in pre-ADR-0011 behavior (only top-level is cooled, deps come from current homebrew-core) |
+| **S-35** | dep tree recurses past `BREW_COOLDOWN_MAX_DEP_DEPTH` (default 10) | `brew-cooldown install <pkg>` with a deeply-nested fixture | exit 1; stderr explains recursion-depth bound was exceeded; suggests `BREW_COOLDOWN_MAX_DEP_DEPTH=<higher>` or `--no-cool-deps` |
+| **S-36** | one of the pre-installed deps fails (held with no rewind, brew install failure, etc.) | `brew-cooldown install <pkg>` | exit non-zero with the dep's own error message; **no** top-level install attempted (fail-stop on any dep failure to avoid partially-cooled state) |
+
 ## Pure-function unit-spec rows
 
 | ID | Function | Input | Expected output |
@@ -107,6 +121,19 @@ This is the source of truth for what `brew-cooldown` does. Every row is paired w
 | **U-22** | `find_version_introduction_eligible` (ADR-0010 picker) | parsed commit list = `[(c,intro,1.5.0,@1d), (b,rebuild,1.4.0,@4d), (a,intro,1.4.0,@8d)]`, N=7, M=1 | returns sha=`a`, age=8d — `1.5.0` fails gate (a); `1.4.0` satisfies both gates and is picked at its earliest introduction (`a`), not the later rebuild (`b`) |
 | **U-23** | `find_version_introduction_eligible` (revert-within-hours scenario, commits newest-first): `[(z,intro,V_legit,@7d-30min), (y,intro,V_mal,@7d), (x,intro,V_legit,@10d)]`, N=7, M=1. `V_mal` was introduced at day −7 and reverted 30 minutes later (commit `z` re-introduces `V_legit`). `V_legit` lifetime = (day−10 → day−7) + (day−7+30min → now) ≈ 10 days total. `V_mal` lifetime ≈ 30 min total. | returns sha=`x` (V_legit's *earliest* introduction commit at day −10, age ≈ 10d); V_mal is skipped because gate (b) fails (lifetime 30 min < 1 day); install pins to `x` even though `z` is a more recent V_legit-introduction, because pinning to the earliest in-V commit is the safety property from ADR-0010 Scenario C |
 | **U-24** | `find_version_introduction_eligible` | every commit unrecognized (all `unknown:<sha>`), N=7, M=1 | returns "not found" — the picker explicitly skips any `unknown:*` synthetic version regardless of its individual age or lifetime, so no eligible candidate emerges even if a single unknown commit's HEAD-time would clear both gates on its own |
+| **U-25** | `parse_depends_on` (ADR-0011 parser) | `depends_on "openssl@3"` (simple runtime dep) | returns runtime dep `openssl@3` |
+| **U-26** | `parse_depends_on` | `depends_on "cmake" => :build` (build-only) | dep skipped (not installed for bottle installs) |
+| **U-27** | `parse_depends_on` | `depends_on "openssl@3" => :recommended` | treated as runtime → returned |
+| **U-28** | `parse_depends_on` | `depends_on macos: :sequoia` (OS requirement) | not a formula dep → skipped silently |
+| **U-29** | `parse_depends_on` | inline comment after dep: `depends_on "swig" => :build # for lldb` | comment stripped before matching; line interpreted as `depends_on "swig" => :build` → build-only, skipped |
+| **U-30** | `parse_depends_on` | conditional Ruby: `depends_on "llvm" => :build if DevelopmentTools.clang_build_version <= 1699` | unparseable → function returns non-zero with the offending line cited; caller (Tier 1 orchestrator) surfaces S-33 verdict |
+| **U-31** | `parse_depends_on` | `on_macos do` ... `depends_on "gettext"` ... `end` (within macOS block, user is on macOS) | dep recognized; returned |
+| **U-32** | `parse_depends_on` | `on_linux do` ... `depends_on "util-linux"` ... `end` (within Linux block, user is on macOS) | dep skipped (not on user's platform) |
+| **U-33** | `parse_depends_on` | `uses_from_macos "zlib"` on macOS / on Linux | macOS: skipped (system-provided); Linux: returned as runtime dep |
+| **U-34** | `classify_dep` (ADR-0011 classifier) | dep is already installed at any version, brew would use as-is | classified as `already_installed_use_as_is` → no action |
+| **U-35** | `classify_dep` | dep is not installed; current homebrew-core HEAD is ≥N days old | classified as `not_installed_eligible` → no action (brew installs normally) |
+| **U-36** | `classify_dep` | dep is not installed; current homebrew-core HEAD is <N days old | classified as `not_installed_fresh` → pre-install via brew-cooldown |
+| **U-37** | `classify_dep` | dep is already installed; `brew install --dry-run` indicates a compatibility upgrade to a new version | classified as `compatibility_upgrade` → pre-install upgrade target via brew-cooldown |
 
 ## CI test boundary (important)
 
