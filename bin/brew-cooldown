@@ -753,6 +753,205 @@ try_rewind() {
 }
 
 ###############################################################################
+# Transitive dependency cool (ADR-0011 Tier 1)
+###############################################################################
+
+# Detect the user's OS for `on_macos` / `on_linux` / `uses_from_macos` parsing.
+# Returns "macos" or "linux"; falls back to "linux" for anything unrecognized.
+detect_user_os() {
+    case "$(uname -s 2>/dev/null)" in
+        Darwin) printf 'macos\n' ;;
+        *)      printf 'linux\n' ;;
+    esac
+}
+
+# Detect the user's arch for `on_arm` / `on_intel` parsing.
+detect_user_arch() {
+    case "$(uname -m 2>/dev/null)" in
+        arm64|aarch64) printf 'arm\n' ;;
+        *)             printf 'intel\n' ;;
+    esac
+}
+
+# Parse a formula's `.rb` content for runtime depends_on lines applicable to
+# the user's platform. Stdout: one dep name per line, no duplicates.
+#
+# Args: <formula_content>, <user_os: macos|linux>, <user_arch: arm|intel>
+# Returns: 0 if parsed cleanly, 1 if any line mentioning depends_on couldn't
+# be safely interpreted (sets _dep_parse_error with line citations).
+#
+# Recognized forms (return as runtime dep):
+#   depends_on "name"
+#   depends_on "name" => :recommended
+#   depends_on "name" => :runtime
+#   uses_from_macos "name"                       (on Linux only)
+#   any of the above inside on_macos/on_linux/on_arm/on_intel blocks that
+#   match the user's platform/arch
+#
+# Recognized but skipped:
+#   depends_on "name" => :build|:test|:optional  (not in bottle install / opt-in)
+#   depends_on "name" => [...]                   (typically :build+:test array)
+#   depends_on macos:|arch:|xcode:|maximum_macos:|...  (toolchain/platform req)
+#   inline comments after the dep (stripped before matching)
+#   bottle/head/service/livecheck/patch/resource/test/stable/deprecate do ... end blocks
+#
+# Fail-closed (return 1) for anything else mentioning `depends_on` —
+# typically conditional Ruby like `depends_on "x" if build.head?`.
+parse_depends_on() {
+    local content="$1" user_os="$2" user_arch="$3"
+    _dep_parse_error=""
+
+    # Stack of open contexts. Each entry is "active" (we're processing
+    # depends_on lines inside it) or "_SKIP_<reason>" (ignore everything
+    # until matching end). `do` blocks at file-top-level (like the formula
+    # body itself) are NOT tracked — we rely on the outer file structure.
+    local stack=()
+    local skip_depth=0
+    local seen_lines=0
+    local lineno=0
+    local issues=()
+    # Emitted dep names — avoid dup output
+    local emitted=" "
+
+    local raw trimmed first_word
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        lineno=$((lineno + 1))
+        # Strip leading whitespace for matching
+        trimmed="${raw#"${raw%%[![:space:]]*}"}"
+        # Strip trailing inline comment (` #...` or just `#...` if at end).
+        # Conservatively only strip when '#' is preceded by whitespace, so
+        # we don't mangle strings containing literal '#'.
+        if [[ "$trimmed" =~ ^(.*[^[:space:]])[[:space:]]+#.*$ ]]; then
+            trimmed="${BASH_REMATCH[1]}"
+        fi
+        [[ -z "$trimmed" ]] && continue
+        [[ "$trimmed" == \#* ]] && continue
+
+        # ----- end of any tracked block -----
+        if [[ "$trimmed" == "end" ]] && (( ${#stack[@]} > 0 )); then
+            local top="${stack[${#stack[@]}-1]}"
+            unset 'stack[${#stack[@]}-1]'
+            if [[ "$top" == _SKIP_* ]]; then
+                skip_depth=$((skip_depth - 1))
+            fi
+            continue
+        fi
+
+        # ----- block openings we understand -----
+        # on_macos do | on_linux do | on_arm do | on_intel do
+        if [[ "$trimmed" =~ ^on_macos[[:space:]]+do$ ]]; then
+            if [[ "$user_os" == "macos" ]]; then stack+=("on_macos")
+            else stack+=("_SKIP_on_macos"); skip_depth=$((skip_depth + 1)); fi
+            continue
+        fi
+        if [[ "$trimmed" =~ ^on_linux[[:space:]]+do$ ]]; then
+            if [[ "$user_os" == "linux" ]]; then stack+=("on_linux")
+            else stack+=("_SKIP_on_linux"); skip_depth=$((skip_depth + 1)); fi
+            continue
+        fi
+        if [[ "$trimmed" =~ ^on_arm[[:space:]]+do$ ]]; then
+            if [[ "$user_arch" == "arm" ]]; then stack+=("on_arm")
+            else stack+=("_SKIP_on_arm"); skip_depth=$((skip_depth + 1)); fi
+            continue
+        fi
+        if [[ "$trimmed" =~ ^on_intel[[:space:]]+do$ ]]; then
+            if [[ "$user_arch" == "intel" ]]; then stack+=("on_intel")
+            else stack+=("_SKIP_on_intel"); skip_depth=$((skip_depth + 1)); fi
+            continue
+        fi
+        # head do / service do / livecheck do / patch do / resource do /
+        # test do / stable do / deprecate do — skip the whole block.
+        # Match common single-line block openers; multi-line block headers
+        # (e.g., `head "url" do`) covered by the trailing-do regex below.
+        if [[ "$trimmed" =~ ^head[[:space:]]+do$ ]] \
+           || [[ "$trimmed" =~ ^service[[:space:]]+do$ ]] \
+           || [[ "$trimmed" =~ ^livecheck[[:space:]]+do$ ]] \
+           || [[ "$trimmed" =~ ^patch[[:space:]]+do$ ]] \
+           || [[ "$trimmed" =~ ^resource[[:space:]]+do$ ]] \
+           || [[ "$trimmed" =~ ^test[[:space:]]+do$ ]] \
+           || [[ "$trimmed" =~ ^stable[[:space:]]+do$ ]] \
+           || [[ "$trimmed" =~ ^bottle[[:space:]]+do$ ]] \
+           || [[ "$trimmed" =~ ^deprecate[[:space:]]+do$ ]]; then
+            stack+=("_SKIP_block"); skip_depth=$((skip_depth + 1)); continue
+        fi
+        # head "url", branch: "main" do  — same kind of thing, multi-arg
+        if [[ "$trimmed" =~ ^(head|resource|patch|bottle|service|livecheck|stable|test)[[:space:]]+\".*\".*[[:space:]]do$ ]]; then
+            stack+=("_SKIP_block"); skip_depth=$((skip_depth + 1)); continue
+        fi
+        # Generic `... do` opener for any name we don't recognize — be
+        # conservative and skip the block. (Catches things like
+        # `Pathname.glob(...) do |p|` and similar.)
+        if [[ "$trimmed" == *" do" ]] || [[ "$trimmed" == *" do |"* ]]; then
+            stack+=("_SKIP_block"); skip_depth=$((skip_depth + 1)); continue
+        fi
+
+        # ----- inside a skip block -----
+        if (( skip_depth > 0 )); then continue; fi
+
+        # ----- depends_on patterns -----
+        # depends_on "name"
+        if [[ "$trimmed" =~ ^depends_on[[:space:]]+\"([^\"]+)\"[[:space:]]*$ ]]; then
+            _emit_unique_dep "${BASH_REMATCH[1]}" emitted
+            continue
+        fi
+        # depends_on "name" => :symbol
+        if [[ "$trimmed" =~ ^depends_on[[:space:]]+\"([^\"]+)\"[[:space:]]+=\>[[:space:]]+:([a-z_]+)[[:space:]]*$ ]]; then
+            local n="${BASH_REMATCH[1]}" kind="${BASH_REMATCH[2]}"
+            case "$kind" in
+                build|test|optional) : ;;  # skip
+                recommended|runtime)  _emit_unique_dep "$n" emitted ;;
+                *) issues+=("line $lineno: unknown depends_on symbol :$kind: $trimmed") ;;
+            esac
+            continue
+        fi
+        # depends_on "name" => [:a, :b, ...] — array second arg.
+        # Conservatively: if the array contains :build or :test only, skip;
+        # otherwise treat as runtime. For simplicity, skip in all cases
+        # (the dominant in-the-wild use is `=> [:build, :test]`).
+        if [[ "$trimmed" =~ ^depends_on[[:space:]]+\"[^\"]+\"[[:space:]]+=\>[[:space:]]+\[ ]]; then
+            continue
+        fi
+        # depends_on with non-string keyword first arg (macos:, arch:, xcode:,
+        # maximum_macos:, etc.) — toolchain/platform requirement, not a formula dep
+        if [[ "$trimmed" =~ ^depends_on[[:space:]]+[a-z_]+: ]]; then
+            continue
+        fi
+        # uses_from_macos "name" — on macOS skip; on Linux treat as runtime
+        if [[ "$trimmed" =~ ^uses_from_macos[[:space:]]+\"([^\"]+)\" ]]; then
+            if [[ "$user_os" == "linux" ]]; then
+                _emit_unique_dep "${BASH_REMATCH[1]}" emitted
+            fi
+            continue
+        fi
+
+        # ----- anything else mentioning depends_on is unparseable -----
+        if [[ "$trimmed" == *"depends_on"* ]]; then
+            issues+=("line $lineno: unparseable depends_on form: $trimmed")
+        fi
+    done <<< "$content"
+
+    if (( ${#issues[@]} > 0 )); then
+        local joined
+        printf -v joined '%s\n' "${issues[@]}"
+        _dep_parse_error="$joined"
+        return 1
+    fi
+    return 0
+}
+
+# Emit a dep name iff not already emitted. Tracks via the caller's "emitted"
+# variable (passed by reference name to keep dedup state across the loop).
+_emit_unique_dep() {
+    local name="$1"
+    local refname="$2"
+    local tracked="${!refname}"
+    if [[ "$tracked" != *" $name "* ]]; then
+        printf '%s\n' "$name"
+        eval "$refname='${tracked}$name '"
+    fi
+}
+
+###############################################################################
 # brew invocation (or dry-run print)
 ###############################################################################
 
