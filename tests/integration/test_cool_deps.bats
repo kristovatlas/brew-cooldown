@@ -42,6 +42,8 @@ RB
 
 @test "S-30: top-level eligible, sole dep eligible at HEAD too → no subprocess, plain brew install" {
     # alpha eligible at HEAD; its dep gamma is also eligible at HEAD (12d old).
+    # gamma's own subtree is still walked (its content is fetched and parsed),
+    # but gamma itself needs no pre-install and has no deps of its own.
     bc_set_commits_for alpha aaaa01:14:"alpha 1.0.0"
     bc_set_raw_for alpha "$(cat <<'RB'
 class Alpha < Formula
@@ -52,16 +54,73 @@ end
 RB
 )"
     bc_set_commits_for gamma gg01:12:"gamma 2.0.0"
+    bc_set_raw_for gamma "$(cat <<'RB'
+class Gamma < Formula
+  url "https://example.com/g.tar.gz"
+  sha256 "def"
+end
+RB
+)"
 
     run "$BC_SCRIPT" install alpha
     [ "$status" -eq 0 ]
     # brew install was invoked once, for the top-level only (no force-bottle)
     grep -qE "^install alpha$" "$BC_BREW_LOG"
     ! grep -qE "force-bottle" "$BC_BREW_LOG"
+    # gamma's subtree WAS walked: its raw content was fetched
+    grep -qE "raw\.githubusercontent\.com/Homebrew/homebrew-core/HEAD/Formula/g/gamma\.rb" "$BC_CURL_LOG"
     # No tap directory staged (no rewind, no subprocess install)
     if [[ -d "${BC_BREW_REPO}/Library/Taps/brew-cooldown" ]]; then
         ! find "${BC_BREW_REPO}/Library/Taps/brew-cooldown" -maxdepth 1 -name 'homebrew-cooldown-*' | grep -q .
     fi
+}
+
+@test "S-31b: fresh grandchild under an eligible uninstalled dep is still cooled (subtree walk)" {
+    # alpha (eligible) → beta (NOT installed, eligible at HEAD) → gamma (NOT
+    # installed, FRESH). Without the subtree walk, brew would install gamma
+    # ungated as part of installing beta during alpha's install. The walk
+    # must descend through eligible-but-uninstalled beta and pre-cool gamma.
+    bc_set_commits_for alpha aaaa01:14:"alpha 1.0.0"
+    bc_set_raw_for alpha "$(cat <<'RB'
+class Alpha < Formula
+  url "https://example.com/a.tar.gz"
+  sha256 "abc"
+  depends_on "beta"
+end
+RB
+)"
+    # beta: eligible at HEAD (12d), has its own dep gamma
+    bc_set_commits_for beta bb01:12:"beta 2.0.0"
+    bc_set_raw_for beta "$(cat <<'RB'
+class Beta < Formula
+  url "https://example.com/b.tar.gz"
+  sha256 "bcd"
+  depends_on "gamma"
+end
+RB
+)"
+    # gamma: fresh at HEAD (1d), with a version-introduction candidate at 10d
+    bc_set_commits_for gamma gg02:1:"gamma 1.1.0" gg01:10:"gamma 1.0.0"
+    bc_set_raw_for gamma "$(cat <<'RB'
+class Gamma < Formula
+  url "https://example.com/g.tar.gz"
+  sha256 "def"
+end
+RB
+)"
+
+    run "$BC_SCRIPT" install alpha
+    [ "$status" -eq 0 ]
+    # gamma was pre-installed via recursive subprocess (rewind + force-bottle)
+    grep -qE "^install --force-bottle brew-cooldown/cooldown-[A-Za-z0-9]+/gamma$" "$BC_BREW_LOG"
+    # beta itself was NOT pre-installed (it's eligible; brew handles it)
+    ! grep -qE "force-bottle .*/beta$" "$BC_BREW_LOG"
+    # top-level alpha installed after gamma
+    grep -qE "^install alpha$" "$BC_BREW_LOG"
+    local gamma_line alpha_line
+    gamma_line=$(grep -nE "^install --force-bottle .*/gamma$" "$BC_BREW_LOG" | head -1 | cut -d: -f1)
+    alpha_line=$(grep -nE "^install alpha$" "$BC_BREW_LOG" | head -1 | cut -d: -f1)
+    [ -n "$gamma_line" ] && [ -n "$alpha_line" ] && [ "$gamma_line" -lt "$alpha_line" ]
 }
 
 @test "S-30b: top-level eligible, sole dep already installed → no subprocess, dep untouched (firewall not auditor)" {

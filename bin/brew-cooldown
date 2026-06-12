@@ -980,17 +980,21 @@ _emit_unique_dep() {
 #   <formula_name>: the formula whose deps we're walking
 #   <source>: "rewound" (read content from the staged tap) or "head" (fetch
 #             current homebrew-core content via raw URL)
+#   [depth]: current recursion depth (defaults to BC_DEP_DEPTH, which is set
+#            via env in subprocess recursion; in-process recursion passes it
+#            explicitly)
 #
 # Returns:
-#   0 — all deps either already-installed-as-is, eligible at current HEAD,
-#       or successfully pre-installed via recursive subprocess
+#   0 — all deps either already-installed-as-is, eligible at current HEAD
+#       (with their own subtrees walked), or successfully pre-installed via
+#       recursive subprocess
 #   1 — parser failure (sets _dep_parse_error) or recursion-depth bound exceeded
 #   2 — lookup/fetch/subprocess failure (sets _error_reason)
 cool_deps_for_one_formula() {
     local name="$1" source="$2"
+    local depth="${3:-${BC_DEP_DEPTH:-0}}"
 
     # Bound recursion depth before doing any work.
-    local depth="${BC_DEP_DEPTH:-0}"
     if (( depth >= BC_MAX_DEP_DEPTH )); then
         _error_reason="dep recursion exceeded BC_MAX_DEP_DEPTH=$BC_MAX_DEP_DEPTH (cooling $name at depth $depth); raise BREW_COOLDOWN_MAX_DEP_DEPTH or use --no-cool-deps"
         return 1
@@ -1041,19 +1045,22 @@ cool_deps_for_one_formula() {
     local dep
     while IFS= read -r dep; do
         [[ -z "$dep" ]] && continue
-        cool_one_dep "$dep" || return $?
+        cool_one_dep "$dep" "$depth" || return $?
     done <<< "$deps"
 
     return 0
 }
 
 # Classify a single dep and pre-install via subprocess if it's fresh.
-# Args: <dep_name>
+# Args: <dep_name> [depth]
 # Returns: 0 (handled), 1 (parser/depth failure during recursion), 2 (lookup/install failure)
 cool_one_dep() {
     local dep="$1"
+    local depth="${2:-${BC_DEP_DEPTH:-0}}"
 
     # 1. Already installed at any version: firewall, not auditor — skip.
+    # (Subtree not walked: brew guarantees an installed formula's runtime
+    # deps were installed with it, so nothing new enters via this branch.)
     if brew_formula_installed "$dep"; then
         debug "$dep: already installed, skipping (ADR-0011: firewall, not auditor)"
         return 0
@@ -1064,14 +1071,19 @@ cool_one_dep() {
     check_cooldown "$dep" formula || rc=$?
     case "$rc" in
         0)
-            # Eligible at HEAD — brew will install it normally; we don't need to intervene.
-            debug "$dep: not installed, current HEAD eligible (age ${_age_days}d ≥ ${BC_DAYS}d)"
-            return 0
+            # Eligible at HEAD — brew will install it normally, no pre-install
+            # needed for the dep itself. BUT brew will also install this dep's
+            # own missing deps as part of the same operation, and those are new
+            # code entering the system too — walk the subtree so a fresh
+            # grandchild can't slip in under an eligible parent.
+            debug "$dep: not installed, current HEAD eligible (age ${_age_days}d ≥ ${BC_DAYS}d); walking its dep subtree"
+            cool_deps_for_one_formula "$dep" head $((depth + 1))
+            return $?
             ;;
         1)
             # Fresh — needs pre-install via recursive subprocess.
             log_info "$dep: not installed, current HEAD fresh (age ${_age_days}d < ${BC_DAYS}d) — pre-installing via brew-cooldown (ADR-0011)"
-            local new_depth=$((${BC_DEP_DEPTH:-0} + 1))
+            local new_depth=$((depth + 1))
             # Propagate relevant configuration to the subprocess as env vars.
             # CLI flags become env-derived values in the child via the existing
             # env-loading code in main(). We only set vars whose values differ

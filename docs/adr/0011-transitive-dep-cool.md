@@ -33,10 +33,10 @@ After parsing the rewound top-level formula's `depends_on` lines and walking the
 
 | dep state | action | rationale |
 |---|---|---|
-| **Already installed at version V; brew will use it as-is** | No action. | Firewall, not auditor: pre-existing installs of any age are out of scope. |
+| **Already installed at version V; brew will use it as-is** | No action; subtree not walked. | Firewall, not auditor: pre-existing installs of any age are out of scope. Brew guarantees an installed formula's runtime deps were installed with it, so nothing new enters via this branch. (Degenerate exception: a user who force-removed a dep with `--ignore-dependencies` has broken that invariant; brew would reinstall the missing dep ungated. We accept this — the user explicitly broke brew's consistency model.) |
 | **Already installed at version V; brew will upgrade to version W for this command** | Treat as a new install of W → pre-install W via brew-cooldown first. | The upgrade introduces new code; the firewall gates it. |
-| **Not installed; current homebrew-core HEAD is ≥N days old (eligible)** | No action; brew installs the current version normally. | Would have been eligible under the cooldown anyway. |
-| **Not installed; current homebrew-core HEAD is <N days old (fresh)** | Pre-install the dep via brew-cooldown (the dep's own cooldown decision applies — rewind, hold, etc.). | The firewall's standard cooldown promise on new code. |
+| **Not installed; current homebrew-core HEAD is ≥N days old (eligible)** | No pre-install of the dep itself (brew installs the current version normally), **but its own dep subtree is recursively walked** — brew will install this dep's missing deps as part of the same operation, and a fresh grandchild must not slip in under an eligible parent. | Would have been eligible under the cooldown anyway; its subtree is new code entering the system and gets the same gate. |
+| **Not installed; current homebrew-core HEAD is <N days old (fresh)** | Pre-install the dep via brew-cooldown (the dep's own cooldown decision applies — rewind, hold, etc.). The recursive invocation walks the dep's own subtree in turn. | The firewall's standard cooldown promise on new code. |
 
 Compatibility upgrades (the second row) are detected by inspecting brew's resolution plan — e.g., `brew install --dry-run` or equivalent — before invoking the actual install.
 
