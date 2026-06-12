@@ -61,6 +61,8 @@ User remediation when this happens:
 
 Empirically (from the prototype run during the design discussion), ~94% of representative formulae parse cleanly with the inline-comment-strip; the failures are limited to a small set of formulae with conditional Ruby in their dep declarations. Most users will never hit a parse failure.
 
+**Known false-positive class (discovered in live scanning, 2026-06-12):** the unparseable-detector triggers on any line *mentioning* `depends_on`, including string literals. Real example — the `vis` formula contains `odie 'Switch to ``depends_on "lua"``!' if build.stable? && version > "0.9"` inside `def install`; that line is a Ruby string, not a dep declaration, but the parser fails closed on it and blocks the install. This is the accepted cost of the fail-closed direction: narrowing the detector (e.g., only lines starting with `depends_on`) would create a fail-open path where a genuine mid-line declaration brew honors goes unwalked. Remediation is `--no-cool-deps` for the affected install. If real-world frequency of this class turns out to be more than a nuisance, a future refinement could skip `def ... end` bodies — at the cost of more Ruby block-structure tracking in the regex state machine.
+
 ### Topological sort + per-dep pre-install
 
 When ≥1 dep needs pre-installing (rows 2 and 4 above), brew-cooldown:

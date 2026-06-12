@@ -153,3 +153,11 @@ brew-cooldown --dry-run install wget        # prints brew argv, exits 0
 brew-cooldown --dry-run upgrade             # parses real brew outdated, prints survivor list
 brew-cooldown --debug --dry-run install <pkg>   # prints redacted curl URL + parsed date
 ```
+
+For structured live testing on a real Mac, `tests/live/run-live-tests.sh` runs a
+self-asserting scenario suite (rewound real installs, ADR-0009 pre-flight,
+ADR-0011 fresh-dep pre-cool, parser fail-closed) against real brew + real
+GitHub, mutating only an explicit sacrificial-formula allowlist, and prints a
+single PASS/FAIL/SKIP summary block. It probes current homebrew-core state with
+dry-runs first and SKIPs scenarios whose time-case isn't live today. It is
+**never** run in CI (see "CI test boundary" above).
