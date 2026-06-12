@@ -269,6 +269,117 @@ RB
     ! echo "$output" | grep -q '^cmake$'
 }
 
+@test "U-38: on_system block → fail-closed (cannot resolve applicability)" {
+    local content
+    content=$(cat <<'RB'
+on_system :linux, macos: :ventura_or_newer do
+  depends_on "libfoo"
+end
+depends_on "openssl@3"
+RB
+)
+    run parse_depends_on "$content" macos arm
+    [ "$status" -eq 1 ]
+}
+
+@test "U-38b: on_sonoma :or_newer block → fail-closed" {
+    local content
+    content=$(cat <<'RB'
+on_sonoma :or_newer do
+  depends_on "macdep"
+end
+RB
+)
+    run parse_depends_on "$content" macos arm
+    [ "$status" -eq 1 ]
+}
+
+@test "U-38c: on_macos with a version symbol arg → fail-closed (only bare 'on_macos do' is resolvable)" {
+    run parse_depends_on 'on_macos :sequoia do' macos arm
+    [ "$status" -eq 1 ]
+}
+
+@test "U-39: heredoc containing shell for...do does not swallow later deps" {
+    local content
+    content=$(cat <<'RB'
+test do
+  (testpath/"t.sh").write <<~EOS
+    for f in *.txt; do
+      echo "$f"
+    done
+  EOS
+end
+depends_on "openssl@3"
+RB
+)
+    run parse_depends_on "$content" macos arm
+    [ "$status" -eq 0 ]
+    [ "$output" = "openssl@3" ]
+}
+
+@test "U-39b: caveats heredoc with prose ending in ' do' does not swallow later deps" {
+    local content
+    content=$(cat <<'RB'
+caveats <<~EOS
+  Decide what you want to do
+  then restart.
+EOS
+depends_on "openssl@3"
+RB
+)
+    run parse_depends_on "$content" macos arm
+    [ "$status" -eq 0 ]
+    [ "$output" = "openssl@3" ]
+}
+
+@test "U-39c: heredoc body mentioning depends_on is NOT flagged unparseable (it's a string)" {
+    local content
+    content=$(cat <<'RB'
+def install
+end
+caveats <<~EOS
+  If this breaks, depends_on "lua" might be why.
+EOS
+depends_on "openssl@3"
+RB
+)
+    run parse_depends_on "$content" macos arm
+    [ "$status" -eq 0 ]
+    [ "$output" = "openssl@3" ]
+}
+
+@test "U-40: depends_on => [:build, :test] array → skipped" {
+    run parse_depends_on 'depends_on "cmake" => [:build, :test]' macos arm
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "U-40b: depends_on => [:recommended] array → emitted as runtime" {
+    run parse_depends_on 'depends_on "pyfoo" => [:recommended]' macos arm
+    [ "$status" -eq 0 ]
+    [ "$output" = "pyfoo" ]
+}
+
+@test "U-40c: depends_on => [:bogus] array → fail-closed" {
+    run parse_depends_on 'depends_on "x" => [:bogus]' macos arm
+    [ "$status" -eq 1 ]
+}
+
+@test "U-41: uses_from_macos => :build on Linux → skipped (not part of bottle install)" {
+    run parse_depends_on 'uses_from_macos "bison" => :build' linux intel
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "U-41b: uses_from_macos with since: on Linux → emitted; on macOS → skipped" {
+    run parse_depends_on 'uses_from_macos "curl", since: :sequoia' linux intel
+    [ "$status" -eq 0 ]
+    [ "$output" = "curl" ]
+    run parse_depends_on 'uses_from_macos "curl", since: :sequoia' macos arm
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
 @test "Empty / dep-less formula parses cleanly with no output" {
     local content
     content=$(cat <<'RB'

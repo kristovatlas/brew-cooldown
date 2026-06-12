@@ -833,12 +833,27 @@ parse_depends_on() {
     local issues=()
     # Emitted dep names — avoid dup output
     local emitted=" "
+    # Heredoc tracking: while non-empty, we are inside a heredoc body and
+    # ignore every line until one that trims to exactly this delimiter.
+    # Without this, heredoc content (shell scripts in test blocks, caveats
+    # prose) containing a line that ends in ` do` would push a skip-block
+    # that never pops — silently swallowing every later depends_on
+    # (fail-open / under-walk). Found by adversarial review.
+    local heredoc_delim=""
+    local heredoc_re='<<[-~]?["'\'']?([A-Z][A-Z0-9_]*)'
 
     local raw trimmed first_word
     while IFS= read -r raw || [[ -n "$raw" ]]; do
         lineno=$((lineno + 1))
         # Strip leading whitespace for matching
         trimmed="${raw#"${raw%%[![:space:]]*}"}"
+
+        # ----- heredoc body: ignore everything until the delimiter line -----
+        if [[ -n "$heredoc_delim" ]]; then
+            if [[ "$trimmed" == "$heredoc_delim" ]]; then heredoc_delim=""; fi
+            continue
+        fi
+
         # Strip trailing inline comment (` #...` or just `#...` if at end).
         # Conservatively only strip when '#' is preceded by whitespace, so
         # we don't mangle strings containing literal '#'.
@@ -847,6 +862,16 @@ parse_depends_on() {
         fi
         [[ -z "$trimmed" ]] && continue
         [[ "$trimmed" == \#* ]] && continue
+
+        # ----- heredoc start (<<~EOS / <<-EOS / <<EOS, optionally quoted) -----
+        # The opening line itself is never a dep declaration; record the
+        # delimiter and skip body lines from the next iteration on. This
+        # check runs even inside skip blocks so heredoc content can't
+        # corrupt the block-depth bookkeeping.
+        if [[ "$trimmed" == *'<<'* ]] && [[ "$trimmed" =~ $heredoc_re ]]; then
+            heredoc_delim="${BASH_REMATCH[1]}"
+            continue
+        fi
 
         # ----- end of any tracked block -----
         if [[ "$trimmed" == "end" ]] && (( ${#stack[@]} > 0 )); then
@@ -878,6 +903,18 @@ parse_depends_on() {
         if [[ "$trimmed" =~ ^on_intel[[:space:]]+do$ ]]; then
             if [[ "$user_arch" == "intel" ]]; then stack+=("on_intel")
             else stack+=("_SKIP_on_intel"); skip_depth=$((skip_depth + 1)); fi
+            continue
+        fi
+        # Any OTHER on_* opener — on_system, on_sonoma/on_ventura/... (macOS
+        # version-gated), on_macos :sym do, etc. We cannot resolve whether the
+        # block applies to this user, and letting it fall into the generic
+        # do-skip would silently drop any depends_on inside (fail-open /
+        # under-walk — the one direction we must never fail). Fail closed.
+        # Found by adversarial review. Future work: resolve version-gated
+        # blocks against sw_vers.
+        if [[ "$trimmed" =~ ^on_[a-z0-9_]+ ]] && [[ "$trimmed" == *" do" ]]; then
+            issues+=("line $lineno: unrecognized platform block (cannot resolve applicability): $trimmed")
+            stack+=("_SKIP_unknown_platform"); skip_depth=$((skip_depth + 1))
             continue
         fi
         # head do / service do / livecheck do / patch do / resource do /
@@ -925,11 +962,33 @@ parse_depends_on() {
             esac
             continue
         fi
-        # depends_on "name" => [:a, :b, ...] — array second arg.
-        # Conservatively: if the array contains :build or :test only, skip;
-        # otherwise treat as runtime. For simplicity, skip in all cases
-        # (the dominant in-the-wild use is `=> [:build, :test]`).
+        # depends_on "name" => [:a, :b, ...] — array role form. Parse the
+        # roles: pure build/test/optional → skip; any recommended/runtime →
+        # emit; anything unrecognized → fail closed. (Previously skipped
+        # unconditionally, which silently dropped `=> [:recommended]` — a
+        # runtime dep. Found by adversarial review.)
+        if [[ "$trimmed" =~ ^depends_on[[:space:]]+\"([^\"]+)\"[[:space:]]+=\>[[:space:]]+\[([^]]*)\][[:space:]]*$ ]]; then
+            local arr_name="${BASH_REMATCH[1]}" arr_contents="${BASH_REMATCH[2]}"
+            local arr_tok arr_runtime=0 arr_unknown=0
+            for arr_tok in ${arr_contents//,/ }; do
+                arr_tok="${arr_tok#:}"
+                case "$arr_tok" in
+                    build|test|optional)  : ;;
+                    recommended|runtime)  arr_runtime=1 ;;
+                    *)                    arr_unknown=1 ;;
+                esac
+            done
+            if (( arr_unknown )); then
+                issues+=("line $lineno: unrecognized role in depends_on array: $trimmed")
+            elif (( arr_runtime )); then
+                _emit_unique_dep "$arr_name" emitted
+            fi
+            continue
+        fi
+        # Array form that didn't match the strict shape above (multiline
+        # array, nested brackets, ...) — fail closed rather than guess.
         if [[ "$trimmed" =~ ^depends_on[[:space:]]+\"[^\"]+\"[[:space:]]+=\>[[:space:]]+\[ ]]; then
+            issues+=("line $lineno: unparseable depends_on array form: $trimmed")
             continue
         fi
         # depends_on with non-string keyword first arg (macos:, arch:, xcode:,
@@ -937,10 +996,38 @@ parse_depends_on() {
         if [[ "$trimmed" =~ ^depends_on[[:space:]]+[a-z_]+: ]]; then
             continue
         fi
-        # uses_from_macos "name" — on macOS skip; on Linux treat as runtime
-        if [[ "$trimmed" =~ ^uses_from_macos[[:space:]]+\"([^\"]+)\" ]]; then
-            if [[ "$user_os" == "linux" ]]; then
-                _emit_unique_dep "${BASH_REMATCH[1]}" emitted
+        # uses_from_macos "name"[, since: :ver][ => :role] — on macOS the
+        # system provides it (skip); on Linux it's a real dep UNLESS the
+        # role is build/test/optional. (Previously the role was ignored,
+        # over-cooling Linux build deps; and `since:` was matched only by
+        # accident of a loose prefix regex. Found by adversarial review.)
+        if [[ "$trimmed" =~ ^uses_from_macos[[:space:]]+\"([^\"]+)\"(.*)$ ]]; then
+            local ufm_name="${BASH_REMATCH[1]}" ufm_rest="${BASH_REMATCH[2]}"
+            ufm_rest="${ufm_rest#,}"
+            ufm_rest="${ufm_rest#"${ufm_rest%%[![:space:]]*}"}"
+            if [[ -z "$ufm_rest" ]] || [[ "$ufm_rest" =~ ^since:[[:space:]]*:[a-z0-9_]+$ ]]; then
+                [[ "$user_os" == "linux" ]] && _emit_unique_dep "$ufm_name" emitted
+            elif [[ "$ufm_rest" =~ ^=\>[[:space:]]*:(build|test|optional)$ ]]; then
+                : # not part of a bottle install on either platform
+            elif [[ "$ufm_rest" =~ ^=\>[[:space:]]*:(recommended|runtime)$ ]]; then
+                [[ "$user_os" == "linux" ]] && _emit_unique_dep "$ufm_name" emitted
+            elif [[ "$ufm_rest" =~ ^=\>[[:space:]]*\[([^]]*)\]$ ]]; then
+                local ufm_tok ufm_runtime=0 ufm_unknown=0
+                for ufm_tok in ${BASH_REMATCH[1]//,/ }; do
+                    ufm_tok="${ufm_tok#:}"
+                    case "$ufm_tok" in
+                        build|test|optional) : ;;
+                        recommended|runtime) ufm_runtime=1 ;;
+                        *)                   ufm_unknown=1 ;;
+                    esac
+                done
+                if (( ufm_unknown )); then
+                    issues+=("line $lineno: unrecognized uses_from_macos form: $trimmed")
+                elif (( ufm_runtime )) && [[ "$user_os" == "linux" ]]; then
+                    _emit_unique_dep "$ufm_name" emitted
+                fi
+            else
+                issues+=("line $lineno: unrecognized uses_from_macos form: $trimmed")
             fi
             continue
         fi
@@ -1084,21 +1171,30 @@ cool_one_dep() {
             # Fresh — needs pre-install via recursive subprocess.
             log_info "$dep: not installed, current HEAD fresh (age ${_age_days}d < ${BC_DAYS}d) — pre-installing via brew-cooldown (ADR-0011)"
             local new_depth=$((depth + 1))
-            # Propagate relevant configuration to the subprocess as env vars.
-            # CLI flags become env-derived values in the child via the existing
-            # env-loading code in main(). We only set vars whose values differ
-            # from default to keep the child's env clean.
-            local -a env_pairs=("BC_DEP_DEPTH=$new_depth")
-            [[ "$BC_DAYS" != "$BC_DEFAULT_DAYS" ]] && env_pairs+=("BREW_COOLDOWN_DAYS=$BC_DAYS")
+            # Propagate the parent's FULLY-RESOLVED settings to the subprocess.
+            # Always pass every value (env beats config-file in the child's
+            # precedence chain, so the parent is authoritative). Diffing
+            # against compiled defaults — the previous approach — was wrong:
+            # when a CLI flag resolved a setting to the same value as the
+            # compiled default, nothing was passed and the child's config
+            # file silently won (e.g. config DAYS=3 + parent --days 7 gave
+            # deps a 3-day cooldown). Found by adversarial review.
+            local -a env_pairs=(
+                "BC_DEP_DEPTH=$new_depth"
+                "BREW_COOLDOWN_DAYS=$BC_DAYS"
+                "BREW_COOLDOWN_FAIL_OPEN=$BC_FAIL_OPEN"
+                "BREW_COOLDOWN_STRICT=$BC_STRICT"
+                "BREW_COOLDOWN_NO_REWIND=$BC_NO_REWIND"
+                "BREW_COOLDOWN_DEBUG=$BC_DEBUG"
+                "BREW_COOLDOWN_MAX_REWIND_COMMITS=$BC_MAX_REWIND_COMMITS"
+                "BREW_COOLDOWN_MIN_LIFETIME_DAYS=$BC_MIN_LIFETIME_DAYS"
+                "BREW_COOLDOWN_MAX_DEP_DEPTH=$BC_MAX_DEP_DEPTH"
+            )
             [[ -n "${BC_TOKEN:-}" ]] && env_pairs+=("BREW_COOLDOWN_GITHUB_TOKEN=$BC_TOKEN")
-            [[ "${BC_FAIL_OPEN:-0}" == "1" ]] && env_pairs+=("BREW_COOLDOWN_FAIL_OPEN=1")
-            [[ "${BC_STRICT:-0}" == "1" ]] && env_pairs+=("BREW_COOLDOWN_STRICT=1")
-            [[ "${BC_NO_REWIND:-0}" == "1" ]] && env_pairs+=("BREW_COOLDOWN_NO_REWIND=1")
-            [[ "${BC_DEBUG:-0}" == "1" ]] && env_pairs+=("BREW_COOLDOWN_DEBUG=1")
+            # BC_DRY_RUN is inherited via plain env (main() respects an
+            # inherited value); set it explicitly for clarity and safety —
+            # a dry-run parent must NEVER cause a real child install.
             [[ "${BC_DRY_RUN:-0}" == "1" ]] && env_pairs+=("BC_DRY_RUN=1")
-            [[ "$BC_MAX_REWIND_COMMITS" != "$BC_DEFAULT_MAX_REWIND_COMMITS" ]] && env_pairs+=("BREW_COOLDOWN_MAX_REWIND_COMMITS=$BC_MAX_REWIND_COMMITS")
-            [[ "$BC_MIN_LIFETIME_DAYS" != "$BC_DEFAULT_MIN_LIFETIME_DAYS" ]] && env_pairs+=("BREW_COOLDOWN_MIN_LIFETIME_DAYS=$BC_MIN_LIFETIME_DAYS")
-            [[ "$BC_MAX_DEP_DEPTH" != "$BC_DEFAULT_MAX_DEP_DEPTH" ]] && env_pairs+=("BREW_COOLDOWN_MAX_DEP_DEPTH=$BC_MAX_DEP_DEPTH")
             if ! env "${env_pairs[@]}" "$BC_SELF_PATH" install "$dep"; then
                 _error_reason="recursive brew-cooldown install failed for transitive dep '$dep' of an ancestor formula"
                 return 2
@@ -1468,16 +1564,19 @@ main() {
     BC_MIN_LIFETIME_DAYS=""
     BC_NO_COOL_DEPS=""
     BC_MAX_DEP_DEPTH=""
-    BC_DRY_RUN=0
+    # Respect an inherited BC_DRY_RUN: ADR-0011 dep subprocesses receive it
+    # via env, and clobbering it here would turn a parent's --dry-run into
+    # REAL child installs (found by adversarial review — critical).
+    BC_DRY_RUN="${BC_DRY_RUN:-0}"
     BC_CASK=0
 
-    # Record our own path for subprocess recursion (ADR-0011 cool_one_dep).
-    # BASH_SOURCE[0] is reliable both when run directly and when sourced
-    # from a wrapper script.
+    # Record our own ABSOLUTE path for subprocess recursion (ADR-0011
+    # cool_one_dep). Resolved eagerly so a child cwd change or PATH lookup
+    # can never resolve to a different brew-cooldown binary.
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        BC_SELF_PATH="${BASH_SOURCE[0]}"
+        BC_SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     elif [[ -n "${0:-}" && -f "${0}" ]]; then
-        BC_SELF_PATH="${0}"
+        BC_SELF_PATH="$(cd "$(dirname "${0}")" && pwd)/$(basename "${0}")"
     else
         BC_SELF_PATH="brew-cooldown"
     fi

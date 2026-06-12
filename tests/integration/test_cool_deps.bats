@@ -243,6 +243,73 @@ RB
     echo "$output" | grep -qi "fail"
 }
 
+@test "S-37: parent's --days flag is authoritative for dep subprocesses even when it equals the compiled default and the config file disagrees" {
+    # Config file says 3 days; the user passes --days 7 (== compiled default).
+    # Pre-fix, the propagation diffed against the compiled default, passed
+    # nothing, and the child re-read the config → deps cooled at 3 days.
+    # beta is 5d old: fresh under the parent's 7, eligible under the config's
+    # 3. Correct behavior: parent classifies beta fresh → subprocess install →
+    # child (with propagated DAYS=7) rewinds beta to its 20d-old intro and
+    # installs via --force-bottle. Buggy behavior: child plain-installs
+    # current beta (`install beta` in the brew log).
+    mkdir -p "$XDG_CONFIG_HOME/brew-cooldown"
+    printf 'BREW_COOLDOWN_DAYS=3\n' > "$XDG_CONFIG_HOME/brew-cooldown/config"
+
+    bc_set_commits_for alpha aaaa01:14:"alpha 1.0.0"
+    bc_set_raw_for alpha "$(cat <<'RB'
+class Alpha < Formula
+  url "https://example.com/a.tar.gz"
+  sha256 "abc"
+  depends_on "beta"
+end
+RB
+)"
+    bc_set_commits_for beta bb02:5:"beta 1.1.0" bb01:20:"beta 1.0.0"
+    bc_set_raw_for beta "$(cat <<'RB'
+class Beta < Formula
+  url "https://example.com/b.tar.gz"
+  sha256 "bcd"
+end
+RB
+)"
+
+    run "$BC_SCRIPT" --days 7 install alpha
+    [ "$status" -eq 0 ]
+    # Child must have cooled beta (rewound, force-bottle) — NOT plain-installed it
+    grep -qE "^install --force-bottle brew-cooldown/cooldown-[A-Za-z0-9]+/beta$" "$BC_BREW_LOG"
+    ! grep -qE "^install beta$" "$BC_BREW_LOG"
+}
+
+@test "S-38: --dry-run with a fresh dep performs NO real installs anywhere (child inherits dry-run)" {
+    # Pre-fix, main() clobbered the inherited BC_DRY_RUN, so the dep
+    # subprocess REALLY installed during a parent --dry-run.
+    bc_set_commits_for alpha aaaa01:14:"alpha 1.0.0"
+    bc_set_raw_for alpha "$(cat <<'RB'
+class Alpha < Formula
+  url "https://example.com/a.tar.gz"
+  sha256 "abc"
+  depends_on "beta"
+end
+RB
+)"
+    bc_set_commits_for beta bb02:1:"beta 1.1.0" bb01:10:"beta 1.0.0"
+    bc_set_raw_for beta "$(cat <<'RB'
+class Beta < Formula
+  url "https://example.com/b.tar.gz"
+  sha256 "bcd"
+end
+RB
+)"
+
+    run "$BC_SCRIPT" --dry-run install alpha
+    [ "$status" -eq 0 ]
+    # The child printed its would-run argv (stdout), the parent printed its own
+    echo "$output" | grep -qE "^brew install --force-bottle brew-cooldown/cooldown-[A-Za-z0-9]+/beta$"
+    echo "$output" | grep -qE "^brew install alpha$"
+    # CRITICAL: no install of ANY kind reached the brew shim
+    ! grep -qE "^install " "$BC_BREW_LOG"
+}
+
 @test "S-34c: opt-out applies even when top-level itself needs rewind (cool_deps walk skipped on both rewound and survivor sets)" {
     # alpha HEAD fresh → would rewind; with --no-cool-deps, no dep walk on
     # alpha's staged content even though staging happened.

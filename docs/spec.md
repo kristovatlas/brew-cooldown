@@ -90,6 +90,8 @@ This is the source of truth for what `brew-cooldown` does. Every row is paired w
 | **S-34** | same scenario as S-33, but `--no-cool-deps` (or `BREW_COOLDOWN_NO_COOL_DEPS=1`) set | `brew-cooldown --no-cool-deps install <pkg>` | dep walk is skipped entirely; top-level install proceeds as in pre-ADR-0011 behavior (only top-level is cooled, deps come from current homebrew-core) |
 | **S-35** | dep tree recurses past `BREW_COOLDOWN_MAX_DEP_DEPTH` (default 10) | `brew-cooldown install <pkg>` with a deeply-nested fixture | exit 1; stderr explains recursion-depth bound was exceeded; suggests `BREW_COOLDOWN_MAX_DEP_DEPTH=<higher>` or `--no-cool-deps` |
 | **S-36** | one of the pre-installed deps fails (held with no rewind, brew install failure, etc.) | `brew-cooldown install <pkg>` | exit non-zero with the dep's own error message; **no** top-level install attempted (fail-stop on any dep failure to avoid partially-cooled state) |
+| **S-37** | config file sets `BREW_COOLDOWN_DAYS=3`; user passes `--days 7` (equal to the compiled default); a dep is 5d old (fresh under 7, eligible under 3) | `brew-cooldown --days 7 install <top>` | the dep subprocess receives the parent's fully-resolved `DAYS=7` via env (which outranks the child's config file) and cools the dep — rewound `--force-bottle` install of an older candidate, **never** a plain install of the 5d-old current version |
+| **S-38** | `--dry-run` on a top-level with a fresh, uninstalled dep | `brew-cooldown --dry-run install <top>` | the dep subprocess inherits dry-run: it prints its would-run `brew install --force-bottle .../<dep>` argv and exits without installing; **no** real `brew install` of any kind occurs anywhere in the tree |
 
 ## Pure-function unit-spec rows
 
@@ -135,6 +137,10 @@ This is the source of truth for what `brew-cooldown` does. Every row is paired w
 | **U-35** | `classify_dep` | dep is not installed; current homebrew-core HEAD is ≥N days old | classified as `not_installed_eligible` → no action (brew installs normally) |
 | **U-36** | `classify_dep` | dep is not installed; current homebrew-core HEAD is <N days old | classified as `not_installed_fresh` → pre-install via brew-cooldown |
 | **U-37** | `classify_dep` | dep is already installed; `brew install --dry-run` indicates a compatibility upgrade to a new version | classified as `compatibility_upgrade` → pre-install upgrade target via brew-cooldown |
+| **U-38** | `parse_depends_on` | any `on_*` opener other than the four bare recognized blocks — `on_system ... do`, `on_sonoma :or_newer do`, `on_macos :sequoia do` | fail-closed (exit 1, line cited) — applicability can't be resolved and silent skipping would drop deps (under-walk) |
+| **U-39** | `parse_depends_on` | heredoc bodies (`<<~EOS`...`EOS`), including lines ending in ` do`, shell loops, or text mentioning `depends_on` | entire body ignored; later `depends_on` lines still parsed; no unparseable flag from string content |
+| **U-40** | `parse_depends_on` | `depends_on "x" => [:build, :test]` / `=> [:recommended]` / `=> [:bogus]` | skip / emit-as-runtime / fail-closed respectively |
+| **U-41** | `parse_depends_on` | `uses_from_macos "x" => :build` (Linux) and `uses_from_macos "x", since: :ver` (both platforms) | build role skipped even on Linux; `since:` form emits on Linux and skips on macOS |
 
 ## CI test boundary (important)
 

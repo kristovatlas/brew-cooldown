@@ -47,9 +47,11 @@ The parser handles the standard BrewTestBot-shaped patterns:
 - `depends_on "name"` → runtime dep
 - `depends_on "name" => :build|:test|:optional` → skip (not installed for bottle installs / not user-requested)
 - `depends_on "name" => :recommended` → treat as runtime
+- `depends_on "name" => [:roles...]` → roles parsed: pure build/test/optional → skip; any recommended/runtime → emit; unrecognized role → fail closed (was: skipped unconditionally, which silently dropped `=> [:recommended]` runtime deps — adversarial-review finding)
 - `depends_on macos:`/`arch:`/`xcode:` → platform/toolchain requirement, not a formula dep
-- `uses_from_macos "name"` → real dep on Linux; no-op on macOS
-- `on_macos { ... }`, `on_linux { ... }`, `on_arm { ... }`, `on_intel { ... }` → context-aware (parser knows which to recurse into based on the user's platform)
+- `uses_from_macos "name"[, since: :ver][ => :role]` → real dep on Linux unless the role is build/test/optional; no-op on macOS; unrecognized forms fail closed
+- `on_macos { ... }`, `on_linux { ... }`, `on_arm { ... }`, `on_intel { ... }` → context-aware (parser knows which to recurse into based on the user's platform). **Any other `on_*` opener** — `on_system`, version-gated `on_sonoma`/`on_ventura`/..., `on_macos :sym do` — **fails closed**: we can't resolve its applicability, and letting it fall into the generic block-skip silently dropped deps that may apply to this user (under-walk — adversarial-review finding). Prevalence at adoption time: ~62 formulae in homebrew-core (<1%). Future work: resolve version-gated blocks against `sw_vers`.
+- Heredoc bodies (`<<~EOS` … `EOS`, `<<-`/`<<` variants, quoted delimiters) → tracked and ignored entirely. Without this, heredoc content with a line ending in ` do` (shell loops in test blocks, even caveats prose) pushed a block-skip that never popped, silently swallowing every later `depends_on` (fail-open — adversarial-review finding). Side benefit: strings inside heredocs that merely *mention* `depends_on` no longer trip the unparseable detector.
 - `bottle do { ... }`, `head do { ... }`, `service do { ... }`, `livecheck do { ... }`, `patch do { ... }`, `resource do { ... }`, `test do { ... }`, `stable do { ... }` → skipped (not dep declarations)
 - Inline comments after `depends_on "name"` (`depends_on "swig" => :build # for lldb`) → stripped before parsing
 
@@ -113,8 +115,26 @@ Tier 2 is documented as a future possible extension in the "Alternatives conside
 - **Use `brew deps --formula <name>` to enumerate deps instead of parsing the .rb file** — considered, rejected for Tier 1's case. The user-invoked install is of a *rewound* version; brew's CLI reports the *current* version's deps. We need to read the rewound formula's content, which means parsing it ourselves.
 - **Recursive depth unbounded** — rejected; pathological inputs could lock the tool. Default depth 10 covers all real-world dep trees observed in homebrew-core.
 
+## Adversarial-review hardening (2026-06-12)
+
+An adversarial code review of the initial implementation refuted its security claim with three fail-open parser holes and two orchestration bugs, all fixed and regression-tested:
+
+1. **Unrecognized `on_*` blocks** (`on_system`, version-gated `on_<macos>`) were silently skipped, dropping any deps inside (under-walk). Now fail-closed; see parser list above.
+2. **Heredoc bodies** could push a never-popped block-skip via lines ending in ` do`, swallowing every later `depends_on` (under-walk). Now tracked and ignored; see parser list above.
+3. **`depends_on "x" => [:recommended]`** (array role form) was skipped unconditionally — a silently dropped runtime dep. Now role-parsed with fail-closed on unknown roles.
+4. **Subprocess config propagation** diffed parent-resolved values against compiled defaults, so a CLI flag that equaled the default was not propagated and the child's config file silently won (e.g., config `DAYS=3` + parent `--days 7` cooled deps at 3 days). Now the parent's fully-resolved values are always passed; env beats config in the child, making the parent authoritative.
+5. **`BC_DRY_RUN` was clobbered by the child's `main()`**, so a `--dry-run` of a formula with a fresh dep performed a REAL install of that dep. Now inherited (`BC_DRY_RUN="${BC_DRY_RUN:-0}"`); regression test S-38 mutation-kills the old behavior.
+
+**Documented, not fixed (accepted or deferred):**
+
+- **Survivor dep-walk TOCTOU.** For eligible top-levels we walk the formula content at GitHub `HEAD`, but brew resolves the actual install from its own (API-cached or locally-cloned) view, which can diverge in either direction in the window between our fetch and brew's install. A dep present in brew's view but absent at our fetched HEAD would install unwalked. This is a narrower instance of threat-model non-mitigation #9(b); the clean fix — sourcing survivor deps from brew's own resolved view (`brew deps`/`brew info --json`) instead of parsing GitHub content — is future work, noted below.
+- **Dependency cycles** (A↔B) are bounded only by `BC_MAX_DEP_DEPTH`: a true cycle burns the full depth in nested subprocesses and then fails closed with a message that suggests raising the bound (which won't help). Safe but wasteful and the message misleads; a visited-set is future work.
+- **Dry-run diamond over-print.** Under `--dry-run`, a dep shared by multiple top-levels prints as "would install" more than once because nothing actually installs to flip `brew_formula_installed`. Cosmetic.
+
 ## Forward references
 
+- **Survivor dep sourcing via brew's own view (`brew deps` / `brew info --json=v2`)** would eliminate the survivor TOCTOU above and shrink the parser's exposure to the rewound-formula case only (where parsing staged content is unavoidable). Worth weighing in v2.
+- **Cycle detection via a visited set** threaded through the walk, replacing depth-exhaustion as the cycle backstop.
 - **Compatibility-upgrade detection (deferred from v1).** Detecting when brew would transparently upgrade an installed dep as part of the top-level install — by parsing `brew install --dry-run` output — was specified in S-32 but is deferred. Currently if brew upgrades an installed dep mid-install, that upgrade bypasses the cooldown. User remediation: `brew-cooldown install <dep>` explicitly before the top-level when the user suspects an upgrade will happen.
 - A future iteration could add a `--cool-deps-depth=N` flag to tune the recursion depth, or a `--cool-deps-only=<list>` for users who want to selectively gate specific deps.
 - The Tier 2 path (full graph cool with pnpm-style semantics) is documented in this ADR's "Alternatives considered" as a future possible extension if a use case justifies the scope expansion.
